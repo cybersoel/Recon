@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-recon.py — Automated Nmap Recon Pipeline
+Recon.py — Automated Nmap Recon Pipeline
 ─────────────────────────────────────────
 Workflow:  UDP (background) → P1 deep top-1000 → P2 full sweep → P3 new-port deep scan
 
-Usage:  sudo python3 recon.py
+Usage:  sudo python3 Recon.py
 """
 
 import subprocess, sys, os, re, signal, time, shutil, ipaddress
@@ -422,7 +422,7 @@ def main():
 
     if os.geteuid() != 0:
         console.print(f"  [{C_WARN}]⚠  Not running as root. UDP & SYN scans require sudo.[/]")
-        console.print(f"    [{C_DIM}]Re-run with:  sudo python3 recon.py[/]\n")
+        console.print(f"    [{C_DIM}]Re-run with:  sudo python3 Recon.py[/]\n")
         sys.exit(1)
 
     target = get_target_ip()
