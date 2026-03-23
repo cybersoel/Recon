@@ -313,7 +313,7 @@ def print_udp_hints(gnmap_path: str):
 
     console.print()
     console.rule(style=C_HINT)
-    console.print(f"  [{C_HINT}]⚡ UDP ATTACK HINTS[/]")
+    console.print(f"  [{C_HINT}]⚡ UDP ATTACK TIPS[/]")
     console.rule(style=C_HINT)
 
     for port in sorted(open_ports):
@@ -346,18 +346,18 @@ def print_summary(target: str, scan_dir: str, raw_dir: str, p1_ports, p2_new, p3
     table.add_row(
         "P1  top-1000",
         f"[green]✓[/]  {len(p1_ports)} port(s)",
-        "cat p1.deep_tcp_top1000.nmap",
+        "cat 01.deep_tcp_top1000.nmap",
     )
     table.add_row(
         "P2  full sweep",
         "[green]✓[/]",
-        "cat p2.sweep_all_tcp_ports.nmap",
+        "cat 02.sweep_all_tcp_ports.nmap",
     )
     if p3_ran:
         table.add_row(
             "P3  new ports",
             f"[green]✓[/]  {len(p2_new)} new port(s)",
-            "cat p3.deep_tcp_targeted.nmap",
+            "cat 04.deep_tcp_targeted.nmap",
         )
     else:
         table.add_row(
@@ -369,7 +369,7 @@ def print_summary(target: str, scan_dir: str, raw_dir: str, p1_ports, p2_new, p3
     table.add_row(
         "UDP targeted",
         udp_status,
-        "cat udp.deep_targeted.nmap",
+        "cat 03.deep_udp_targeted.nmap",
     )
 
     console.print(table)
@@ -378,7 +378,7 @@ def print_summary(target: str, scan_dir: str, raw_dir: str, p1_ports, p2_new, p3
     console.print(f"    [{C_DIM}]Scan results (.nmap) →[/]  {scan_dir}/")
     console.print(f"    [{C_DIM}]Raw data (.gnmap/.xml) →[/]  {scan_dir}/raw/")
     console.print(f"\n  [{C_WARN}]Tip:[/] Open another terminal and run:")
-    console.print(f"    [bold white]cd {scan_dir} && cat p1.deep_tcp_top1000.nmap[/]")
+    console.print(f"    [bold white]cd {scan_dir} && cat 01.deep_tcp_top1000.nmap[/]")
     console.rule(style=C_OK)
     console.print()
 
@@ -424,7 +424,7 @@ def main():
     phase_header("UDP SCAN", f"Background — ports {UDP_PORTS}", C_INFO)
     udp = start_udp_background(target, raw_dir_rel)
     console.print(f"    [{C_OK}]✓ UDP scan launched[/]  [{C_DIM}](PID {udp.pid})[/]")
-    console.print(f"    [{C_DIM}]  Watch live:  tail -f {os.path.abspath(raw_dir_rel)}/udp.deep_targeted.live[/]")
+    console.print(f"    [{C_DIM}]  Watch live:  tail -f {os.path.abspath(raw_dir_rel)}/03.deep_udp_targeted.live[/]")
 
     # ═════════════════════════════════════════════════════════════════════
     #  P1 — Deep top-1000
@@ -432,16 +432,16 @@ def main():
     phase_header("P1 — DEEP TOP-1000", "nmap -Pn -sC -sV -v --open  (scripts + version detection)")
     p1_cmd = [
         "nmap", "-Pn", "-sC", "-sV", "-v", "--open",
-        "-oA", "p1.deep_tcp_top1000",
+        "-oA", "01.deep_tcp_top1000",
         target,
     ]
-    run_nmap_live(p1_cmd, "P1", "p1.deep_tcp_top1000", raw_dir_rel, logfile)
-    p1_ports = extract_ports_from_gnmap(os.path.join(raw_dir_rel, "p1.deep_tcp_top1000.gnmap"))
+    run_nmap_live(p1_cmd, "P1", "01.deep_tcp_top1000", raw_dir_rel, logfile)
+    p1_ports = extract_ports_from_gnmap(os.path.join(raw_dir_rel, "01.deep_tcp_top1000.gnmap"))
 
     if p1_ports:
         console.print(f"\n    [{C_PORT}]P1 open ports:[/]  {', '.join(str(p) for p in sorted(p1_ports))}")
     console.print(f"\n    [{C_WARN}]➜  You can start attacking now from Terminal 2![/]")
-    console.print(f"      [bold white]cat {os.path.abspath('p1.deep_tcp_top1000.nmap')}[/]")
+    console.print(f"      [bold white]cat {os.path.abspath('01.deep_tcp_top1000.nmap')}[/]")
 
     # ═════════════════════════════════════════════════════════════════════
     #  P2 — Full port sweep
@@ -450,16 +450,16 @@ def main():
     phase_header("P2 — FULL PORT SWEEP", "nmap -Pn -n -p- -v --open --min-rate 2000  (all 65535 ports)")
     p2_cmd = [
         "nmap", "-Pn", "-n", "-p-", "-v", "--open", "--min-rate", "2000",
-        "-oA", "p2.sweep_all_tcp_ports",
+        "-oA", "02.sweep_all_tcp_ports",
         target,
     ]
-    run_nmap_live(p2_cmd, "P2", "p2.sweep_all_tcp_ports", raw_dir_rel, logfile)
+    run_nmap_live(p2_cmd, "P2", "02.sweep_all_tcp_ports", raw_dir_rel, logfile)
 
     # ═════════════════════════════════════════════════════════════════════
     #  P3 — Deep scan on NEW ports only
     # ═════════════════════════════════════════════════════════════════════
     time.sleep(3)
-    p2_ports = extract_ports_from_gnmap(os.path.join(raw_dir_rel, "p2.sweep_all_tcp_ports.gnmap"))
+    p2_ports = extract_ports_from_gnmap(os.path.join(raw_dir_rel, "02.sweep_all_tcp_ports.gnmap"))
     new_ports = sorted(p2_ports - TOP_1000)
 
     p3_ran = False
@@ -469,10 +469,10 @@ def main():
         p3_cmd = [
             "nmap", "-Pn", "-sC", "-sV", "-n", "-v", "--open",
             "-p", port_str,
-            "-oA", "p3.deep_tcp_targeted",
+            "-oA", "04.deep_tcp_targeted",
             target,
         ]
-        run_nmap_live(p3_cmd, "P3", "p3.deep_tcp_targeted", raw_dir_rel, logfile)
+        run_nmap_live(p3_cmd, "P3", "04.deep_tcp_targeted", raw_dir_rel, logfile)
         p3_ran = True
     else:
         phase_header("P3 — SKIPPED", "No new ports found beyond top-1000", C_WARN)
@@ -494,7 +494,7 @@ def main():
     move_udp_outputs(raw_dir_rel)
 
     # ── UDP attack hints ──
-    udp_gnmap = os.path.join(raw_dir_rel, "udp.deep_targeted.gnmap")
+    udp_gnmap = os.path.join(raw_dir_rel, "03.deep_udp_targeted.gnmap")
     if udp_done and os.path.exists(udp_gnmap):
         print_udp_hints(udp_gnmap)
 
