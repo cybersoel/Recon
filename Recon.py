@@ -33,47 +33,47 @@ UDP_HINTS = {
     53: (
         "DNS",
         "dig axfr, dnsenum, dnsrecon, fierce",
-        "zone transfers, subdomain enum, record brute-forcing",
+        "attempt zone transfers and brute-force subdomains — leaked records can reveal internal hosts",
     ),
     69: (
         "TFTP",
         "tftp, atftp, nmap tftp-enum",
-        "unauthenticated file retrieval — try grabbing config files, boot images",
+        "grab files blindly (no auth!) — look for config files, boot images, anything juicy",
     ),
     111: (
         "RPCbind",
         "rpcinfo -p, showmount -e, nmap nfs-ls/nfs-showmount",
-        "list RPC services — check for NFS shares to mount and loot",
+        "list RPC services and check for NFS shares you can mount — easy wins if exports are open",
     ),
     123: (
         "NTP",
         "ntpq -c readlist, ntpdc -c monlist, nmap ntp-monlist",
-        "NTP amplification check, leak internal IPs / peer hostnames",
+        "check for monlist amplification and peer info — can leak internal IPs and hostnames",
     ),
     137: (
         "NetBIOS-NS",
         "nbtscan, nmblookup, nmap nbstat",
-        "enumerate NetBIOS names, domain info, logged-in users",
+        "enumerate NetBIOS names, domain info, and logged-in users — quick wins for domain context",
     ),
     161: (
         "SNMP",
         "snmpwalk -v2c -c public, onesixtyone, snmp-check, snmpbulkwalk",
-        "enumerate users, processes, installed software, interfaces, creds/cleartext strings",
+        "enumerate users, processes, installed software, network interfaces — look for creds and cleartext strings",
     ),
     500: (
         "IKE/IPsec",
         "ike-scan -M, strongswan, ikeforce",
-        "VPN enumeration — identify transforms, test aggressive mode for PSK capture",
+        "fingerprint the VPN and test aggressive mode — you might capture a pre-shared key to crack",
     ),
     623: (
         "IPMI/BMC",
         "ipmitool, metasploit ipmi_dumphashes, nmap ipmi-version",
-        "dump password hashes (RAKP), default creds (ADMIN/ADMIN), remote KVM access",
+        "dump RAKP hashes (crackable offline), try default creds (ADMIN/ADMIN) — can lead to remote KVM",
     ),
     1434: (
         "MS-SQL Browser",
         "nmap ms-sql-info, msfconsole mssql_ping, sqsh",
-        "discover SQL Server instances, named instances, their TCP ports — pivot to TCP",
+        "discover hidden SQL Server instances and their TCP ports — then pivot to TCP for the real attack",
     ),
 }
 
@@ -278,8 +278,8 @@ def run_nmap_live(cmd: list, phase_name: str, oA_base: str, raw_dir: str,
 
 def start_udp_background(target: str, raw_dir: str) -> subprocess.Popen:
     global udp_proc
-    live_path = os.path.join(raw_dir, "udp.deep_targeted.live")
-    oA_base   = "udp.deep_targeted"
+    live_path = os.path.join(raw_dir, "03.deep_udp_targeted.live")
+    oA_base   = "03.deep_udp_targeted"
 
     cmd = [
         "nmap", "-Pn", "-sU", "-sV", "-n", "-v",
@@ -300,7 +300,7 @@ def start_udp_background(target: str, raw_dir: str) -> subprocess.Popen:
 
 def move_udp_outputs(raw_dir: str):
     for ext in [".gnmap", ".xml"]:
-        src = f"udp.deep_targeted{ext}"
+        src = f"03.deep_udp_targeted{ext}"
         if os.path.exists(src):
             shutil.move(src, os.path.join(raw_dir, os.path.basename(src)))
 
@@ -320,10 +320,10 @@ def print_udp_hints(gnmap_path: str):
         if port in UDP_HINTS:
             svc, tools, purpose = UDP_HINTS[port]
             console.print(f"\n    [{C_PORT}]UDP/{port}[/] — [{C_SVC}]{svc}[/]")
-            console.print(f"      [{C_INFO}]Tools:[/]    {tools}")
-            console.print(f"      [{C_INFO}]Purpose:[/]  {purpose}")
+            console.print(f"      [{C_HINT}]TIPS:[/]  Try {tools}")
+            console.print(f"            to {purpose}")
         else:
-            console.print(f"\n    [{C_PORT}]UDP/{port}[/] — [{C_DIM}]no predefined hints (check nmap output)[/]")
+            console.print(f"\n    [{C_PORT}]UDP/{port}[/] — [{C_DIM}]no predefined tips (check nmap output)[/]")
 
     console.print()
 
