@@ -80,7 +80,7 @@ Installs to `~/.local/lib/python3.x/`. May not be visible to sudo — same `sudo
 ## Usage
 
 ```bash
-sudo python3 recon.py
+sudo python3 Recon.py
 ```
 
 It will prompt:
@@ -97,7 +97,7 @@ Then all phases run automatically.
 
 | Terminal | What to do |
 |----------|------------|
-| **Terminal 1** | `sudo python3 recon.py` → enter IP, let it run. Don't touch this terminal again. |
+| **Terminal 1** | `sudo python3 Recon.py` → enter IP, let it run. Don't touch this terminal again. |
 | **Terminal 2** | Attack as soon as P1 starts showing open ports. `cd 10.10.10.100 && cat 01.deep_tcp_top1000.nmap` |
 
 ---
