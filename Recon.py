@@ -2,13 +2,12 @@
 """
 recon.py — Automated Nmap Recon Pipeline
 ─────────────────────────────────────────
-Workflow:  UDP (background) → T1 deep top-1000 → T2 full sweep → T4 new-port deep scan
-Based on IppSec methodology. Run in Terminal 1, attack from Terminal 2.
+Workflow:  UDP (background) → P1 deep top-1000 → P2 full sweep → P3 new-port deep scan
 
 Usage:  sudo python3 recon.py
 """
 
-import subprocess, sys, os, re, signal, time, shutil, ipaddress, threading
+import subprocess, sys, os, re, signal, time, shutil, ipaddress
 from pathlib import Path
 from datetime import datetime
 
@@ -17,12 +16,10 @@ try:
     from rich.panel import Panel
     from rich.text import Text
     from rich.table import Table
-    from rich.live import Live
-    from rich.spinner import Spinner
-    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
     from rich import box
 except ImportError:
-    print("[!] Missing 'rich' library. Install with: pip install rich")
+    print("\n[!] Missing 'rich' library.")
+    print("    See README.txt for install options (venv, pipx, apt, etc.)\n")
     sys.exit(1)
 
 # ─── Constants ──────────────────────────────────────────────────────────────
@@ -30,7 +27,57 @@ console = Console()
 
 UDP_PORTS = "53,69,111,123,137,161,500,623,1434"
 
-# Nmap's actual default top-1000 TCP ports (used to diff against T2 results)
+# Short attack-path hints per UDP port
+# Format: { port: (service, tools, purpose) }
+UDP_HINTS = {
+    53: (
+        "DNS",
+        "dig axfr, dnsenum, dnsrecon, fierce",
+        "zone transfers, subdomain enum, record brute-forcing",
+    ),
+    69: (
+        "TFTP",
+        "tftp, atftp, nmap tftp-enum",
+        "unauthenticated file retrieval — try grabbing config files, boot images",
+    ),
+    111: (
+        "RPCbind",
+        "rpcinfo -p, showmount -e, nmap nfs-ls/nfs-showmount",
+        "list RPC services — check for NFS shares to mount and loot",
+    ),
+    123: (
+        "NTP",
+        "ntpq -c readlist, ntpdc -c monlist, nmap ntp-monlist",
+        "NTP amplification check, leak internal IPs / peer hostnames",
+    ),
+    137: (
+        "NetBIOS-NS",
+        "nbtscan, nmblookup, nmap nbstat",
+        "enumerate NetBIOS names, domain info, logged-in users",
+    ),
+    161: (
+        "SNMP",
+        "snmpwalk -v2c -c public, onesixtyone, snmp-check, snmpbulkwalk",
+        "enumerate users, processes, installed software, interfaces, creds/cleartext strings",
+    ),
+    500: (
+        "IKE/IPsec",
+        "ike-scan -M, strongswan, ikeforce",
+        "VPN enumeration — identify transforms, test aggressive mode for PSK capture",
+    ),
+    623: (
+        "IPMI/BMC",
+        "ipmitool, metasploit ipmi_dumphashes, nmap ipmi-version",
+        "dump password hashes (RAKP), default creds (ADMIN/ADMIN), remote KVM access",
+    ),
+    1434: (
+        "MS-SQL Browser",
+        "nmap ms-sql-info, msfconsole mssql_ping, sqsh",
+        "discover SQL Server instances, named instances, their TCP ports — pivot to TCP",
+    ),
+}
+
+# Nmap's actual default top-1000 TCP ports (used to diff against P2 results)
 TOP_1000 = {
     1,3,4,6,7,9,13,17,19,20,21,22,23,24,25,26,30,32,33,37,42,43,49,53,70,
     79,80,81,82,83,84,85,88,89,90,99,100,106,109,110,111,113,119,125,135,139,143,144,
@@ -97,38 +144,37 @@ TOP_1000 = {
 }
 
 # ─── Colors / Theming ───────────────────────────────────────────────────────
-C_PHASE   = "bold cyan"
-C_OK      = "bold green"
-C_WARN    = "bold yellow"
-C_ERR     = "bold red"
-C_DIM     = "dim white"
-C_PORT    = "bold magenta"
-C_INFO    = "bold blue"
-C_HEADER  = "bold white on blue"
+C_PHASE  = "bold cyan"
+C_OK     = "bold green"
+C_WARN   = "bold yellow"
+C_ERR    = "bold red"
+C_DIM    = "dim white"
+C_PORT   = "bold magenta"
+C_INFO   = "bold blue"
+C_HINT   = "bold yellow"
+C_SVC    = "bold white"
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
-udp_proc = None   # global handle so we can clean up on Ctrl+C
+udp_proc = None
+
 
 def banner():
-    """Print the startup banner."""
-    art = r"""
+    art = Text()
+    art.append(r"""
     ╦═╗╔═╗╔═╗╔═╗╔╗╔
     ╠╦╝║╣ ║  ║ ║║║║
-    ╩╚═╚═╝╚═╝╚═╝╝╚╝  v1.0
-    """
-    console.print(Panel(
-        Text(art, style="bold cyan") +
-        Text("\n  Automated Nmap Recon Pipeline", style="bold white") +
-        Text("\n  UDP ║ T1 deep-1000 → T2 full sweep → T4 new-port deep", style="dim white") +
-        Text("\n  Based on IppSec methodology", style="dim cyan"),
-        border_style="cyan",
-        box=box.DOUBLE,
-        padding=(0, 2),
-    ))
+    ╩╚═╚═╝╚═╝╚═╝╝╚╝""", style="bold cyan")
+    art.append("  v1.0\n", style="dim cyan")
+    art.append("\n  Automated Nmap Recon Pipeline", style="bold white")
+    art.append("\n  UDP ║ P1 deep-1000 → P2 full sweep → P3 new-port deep", style="dim white")
+    art.append("\n\n  By ", style="dim white")
+    art.append("Soel Kwun", style="bold cyan")
+    art.append("  (Developed for Personal Use)", style="dim cyan")
+
+    console.print(Panel(art, border_style="cyan", box=box.DOUBLE, padding=(0, 2)))
 
 
 def validate_ip(ip_str: str) -> bool:
-    """Return True if ip_str is a valid IPv4 address."""
     try:
         ipaddress.IPv4Address(ip_str.strip())
         return True
@@ -137,7 +183,6 @@ def validate_ip(ip_str: str) -> bool:
 
 
 def get_target_ip() -> str:
-    """Prompt the user for a target IP."""
     console.print()
     while True:
         ip = console.input("[bold cyan]  Target IP ➜ [/] ").strip()
@@ -147,7 +192,6 @@ def get_target_ip() -> str:
 
 
 def phase_header(label: str, desc: str, style: str = C_PHASE):
-    """Print a prominent phase header."""
     console.print()
     console.rule(style=style)
     console.print(f"  [{style}]▶ {label}[/]  —  {desc}")
@@ -156,7 +200,6 @@ def phase_header(label: str, desc: str, style: str = C_PHASE):
 
 
 def extract_open_ports_from_verbose(line: str):
-    """Parse nmap -v live output for 'Discovered open port' lines."""
     m = re.search(r"Discovered open port (\d+)/(tcp|udp)", line)
     if m:
         return int(m.group(1)), m.group(2)
@@ -164,7 +207,6 @@ def extract_open_ports_from_verbose(line: str):
 
 
 def extract_ports_from_gnmap(gnmap_path: str) -> set:
-    """Pull all open port numbers from a .gnmap file."""
     ports = set()
     try:
         with open(gnmap_path) as f:
@@ -177,17 +219,11 @@ def extract_ports_from_gnmap(gnmap_path: str) -> set:
 
 
 def print_port_discovery(port: int, proto: str, phase: str):
-    """Pretty-print a discovered port."""
     console.print(f"    [{C_PORT}]★ OPEN {proto.upper()}/{port}[/]  [{C_DIM}]({phase})[/]")
 
 
 def run_nmap_live(cmd: list, phase_name: str, oA_base: str, raw_dir: str,
-                  logfile=None, show_ports=True) -> subprocess.CompletedProcess:
-    """
-    Run an nmap command, stream output live (with color), log to file,
-    and highlight discovered ports in real-time.
-    Returns the CompletedProcess-like result.
-    """
+                  logfile=None, show_ports=True) -> subprocess.Popen:
     full_cmd = ["sudo"] + cmd if os.geteuid() != 0 else cmd
     proc = subprocess.Popen(
         full_cmd,
@@ -197,20 +233,16 @@ def run_nmap_live(cmd: list, phase_name: str, oA_base: str, raw_dir: str,
         bufsize=1,
     )
 
-    lines_out = []
     port_count = 0
     start = time.time()
 
     for line in proc.stdout:
-        lines_out.append(line)
         stripped = line.rstrip()
 
-        # Write to combined log
         if logfile:
             logfile.write(line)
             logfile.flush()
 
-        # Highlight discovered ports
         if show_ports:
             found = extract_open_ports_from_verbose(stripped)
             if found:
@@ -218,25 +250,22 @@ def run_nmap_live(cmd: list, phase_name: str, oA_base: str, raw_dir: str,
                 print_port_discovery(found[0], found[1], phase_name)
                 continue
 
-        # Show nmap progress % lines nicely
         if "About " in stripped and "done" in stripped:
             console.print(f"    [{C_DIM}]{stripped.strip()}[/]")
             continue
 
-        # Show NSE / service lines
         if any(k in stripped for k in ["Service Info:", "SF:", "|_", "|  "]):
             console.print(f"    [{C_DIM}]{stripped.strip()}[/]")
 
     proc.wait()
     elapsed = time.time() - start
 
-    # Move non-.nmap files into raw/
+    # Move .gnmap and .xml into raw/
     for ext in [".gnmap", ".xml"]:
         src = f"{oA_base}{ext}"
         if os.path.exists(src):
             shutil.move(src, os.path.join(raw_dir, os.path.basename(src)))
 
-    # Status line
     mins, secs = divmod(int(elapsed), 60)
     if proc.returncode == 0:
         console.print(f"\n    [{C_OK}]✓ {phase_name} complete[/]  "
@@ -248,10 +277,9 @@ def run_nmap_live(cmd: list, phase_name: str, oA_base: str, raw_dir: str,
 
 
 def start_udp_background(target: str, raw_dir: str) -> subprocess.Popen:
-    """Launch the UDP scan in background, output to raw dir."""
     global udp_proc
-    live_path = os.path.join(raw_dir, "03.deep_udp_targeted.live")
-    oA_base   = "03.deep_udp_targeted"
+    live_path = os.path.join(raw_dir, "udp.deep_targeted.live")
+    oA_base   = "udp.deep_targeted"
 
     cmd = [
         "nmap", "-Pn", "-sU", "-sV", "-n", "-v",
@@ -271,15 +299,36 @@ def start_udp_background(target: str, raw_dir: str) -> subprocess.Popen:
 
 
 def move_udp_outputs(raw_dir: str):
-    """Move UDP .gnmap and .xml into raw/, keep .nmap at top level."""
     for ext in [".gnmap", ".xml"]:
-        src = f"03.deep_udp_targeted{ext}"
+        src = f"udp.deep_targeted{ext}"
         if os.path.exists(src):
             shutil.move(src, os.path.join(raw_dir, os.path.basename(src)))
 
 
-def print_summary(target: str, scan_dir: str, raw_dir: str, t1_ports, t2_new, t4_ran, udp_done):
-    """Print a final summary table."""
+def print_udp_hints(gnmap_path: str):
+    """Parse UDP .gnmap for open ports and print attack-path hints."""
+    open_ports = extract_ports_from_gnmap(gnmap_path)
+    if not open_ports:
+        return
+
+    console.print()
+    console.rule(style=C_HINT)
+    console.print(f"  [{C_HINT}]⚡ UDP ATTACK HINTS[/]")
+    console.rule(style=C_HINT)
+
+    for port in sorted(open_ports):
+        if port in UDP_HINTS:
+            svc, tools, purpose = UDP_HINTS[port]
+            console.print(f"\n    [{C_PORT}]UDP/{port}[/] — [{C_SVC}]{svc}[/]")
+            console.print(f"      [{C_INFO}]Tools:[/]    {tools}")
+            console.print(f"      [{C_INFO}]Purpose:[/]  {purpose}")
+        else:
+            console.print(f"\n    [{C_PORT}]UDP/{port}[/] — [{C_DIM}]no predefined hints (check nmap output)[/]")
+
+    console.print()
+
+
+def print_summary(target: str, scan_dir: str, raw_dir: str, p1_ports, p2_new, p3_ran, udp_done):
     console.print()
     console.rule(style=C_OK)
 
@@ -290,29 +339,29 @@ def print_summary(target: str, scan_dir: str, raw_dir: str, t1_ports, t2_new, t4
         title_style="bold green",
         padding=(0, 2),
     )
-    table.add_column("Phase", style="bold cyan", min_width=10)
+    table.add_column("Phase", style="bold cyan", min_width=14)
     table.add_column("Status", style="white", min_width=12)
     table.add_column("Quick View", style="dim white", min_width=40)
 
     table.add_row(
-        "T1  top-1000",
-        f"[green]✓[/]  {len(t1_ports)} port(s)",
-        f"cat 01.deep_tcp_top1000.nmap",
+        "P1  top-1000",
+        f"[green]✓[/]  {len(p1_ports)} port(s)",
+        "cat p1.deep_tcp_top1000.nmap",
     )
     table.add_row(
-        "T2  full sweep",
+        "P2  full sweep",
         "[green]✓[/]",
-        f"cat 02.sweep_all_tcp_ports.nmap",
+        "cat p2.sweep_all_tcp_ports.nmap",
     )
-    if t4_ran:
+    if p3_ran:
         table.add_row(
-            "T4  new ports",
-            f"[green]✓[/]  {len(t2_new)} new port(s)",
-            f"cat 04.deep_tcp_targeted.nmap",
+            "P3  new ports",
+            f"[green]✓[/]  {len(p2_new)} new port(s)",
+            "cat p3.deep_tcp_targeted.nmap",
         )
     else:
         table.add_row(
-            "T4  new ports",
+            "P3  new ports",
             "[yellow]SKIPPED[/]",
             "no new ports beyond top-1000",
         )
@@ -320,23 +369,21 @@ def print_summary(target: str, scan_dir: str, raw_dir: str, t1_ports, t2_new, t4
     table.add_row(
         "UDP targeted",
         udp_status,
-        f"cat 03.deep_udp_targeted.nmap",
+        "cat udp.deep_targeted.nmap",
     )
 
     console.print(table)
 
-    # File listing
     console.print(f"\n  [{C_INFO}]Files:[/]")
     console.print(f"    [{C_DIM}]Scan results (.nmap) →[/]  {scan_dir}/")
     console.print(f"    [{C_DIM}]Raw data (.gnmap/.xml) →[/]  {scan_dir}/raw/")
     console.print(f"\n  [{C_WARN}]Tip:[/] Open another terminal and run:")
-    console.print(f"    [bold white]cd {scan_dir} && cat 01.deep_tcp_top1000.nmap[/]")
+    console.print(f"    [bold white]cd {scan_dir} && cat p1.deep_tcp_top1000.nmap[/]")
     console.rule(style=C_OK)
     console.print()
 
 
 def cleanup(signum=None, frame=None):
-    """Handle Ctrl+C gracefully."""
     global udp_proc
     console.print(f"\n\n  [{C_WARN}]⚠  Interrupted — cleaning up...[/]")
     if udp_proc and udp_proc.poll() is None:
@@ -352,17 +399,15 @@ def main():
 
     banner()
 
-    # ── Check root ──
     if os.geteuid() != 0:
         console.print(f"  [{C_WARN}]⚠  Not running as root. UDP & SYN scans require sudo.[/]")
         console.print(f"    [{C_DIM}]Re-run with:  sudo python3 recon.py[/]\n")
         sys.exit(1)
 
-    # ── Get target ──
     target = get_target_ip()
     console.print(f"\n  [{C_OK}]✓ Target set:[/]  [bold white]{target}[/]\n")
 
-    # ── Create directory structure ──
+    # ── Directory structure ──
     scan_dir = target
     raw_dir  = os.path.join(scan_dir, "raw")
     os.makedirs(raw_dir, exist_ok=True)
@@ -371,72 +416,70 @@ def main():
     console.print(f"  [{C_INFO}]📁 Output directory:[/]  {os.path.abspath('.')}")
     console.print(f"  [{C_DIM}]   └── raw/  (gnmap, xml, logs)[/]")
 
-    # ── Open combined TCP log ──
     logfile = open("00.tcp_chain.log", "w")
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  UDP — Fire in background
-    # ═══════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════
+    #  UDP — Background
+    # ═════════════════════════════════════════════════════════════════════
     phase_header("UDP SCAN", f"Background — ports {UDP_PORTS}", C_INFO)
     udp = start_udp_background(target, raw_dir_rel)
     console.print(f"    [{C_OK}]✓ UDP scan launched[/]  [{C_DIM}](PID {udp.pid})[/]")
-    console.print(f"    [{C_DIM}]  Watch live:  tail -f {os.path.abspath(raw_dir_rel)}/03.deep_udp_targeted.live[/]")
+    console.print(f"    [{C_DIM}]  Watch live:  tail -f {os.path.abspath(raw_dir_rel)}/udp.deep_targeted.live[/]")
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  T1 — Deep top-1000
-    # ═══════════════════════════════════════════════════════════════════════
-    phase_header("T1 — DEEP TOP-1000", "nmap -Pn -sC -sV -v --open  (scripts + version detection)")
-    t1_cmd = [
+    # ═════════════════════════════════════════════════════════════════════
+    #  P1 — Deep top-1000
+    # ═════════════════════════════════════════════════════════════════════
+    phase_header("P1 — DEEP TOP-1000", "nmap -Pn -sC -sV -v --open  (scripts + version detection)")
+    p1_cmd = [
         "nmap", "-Pn", "-sC", "-sV", "-v", "--open",
-        "-oA", "01.deep_tcp_top1000",
+        "-oA", "p1.deep_tcp_top1000",
         target,
     ]
-    run_nmap_live(t1_cmd, "T1", "01.deep_tcp_top1000", raw_dir_rel, logfile)
-    t1_ports = extract_ports_from_gnmap(os.path.join(raw_dir_rel, "01.deep_tcp_top1000.gnmap"))
+    run_nmap_live(p1_cmd, "P1", "p1.deep_tcp_top1000", raw_dir_rel, logfile)
+    p1_ports = extract_ports_from_gnmap(os.path.join(raw_dir_rel, "p1.deep_tcp_top1000.gnmap"))
 
-    if t1_ports:
-        console.print(f"\n    [{C_PORT}]T1 open ports:[/]  {', '.join(str(p) for p in sorted(t1_ports))}")
+    if p1_ports:
+        console.print(f"\n    [{C_PORT}]P1 open ports:[/]  {', '.join(str(p) for p in sorted(p1_ports))}")
     console.print(f"\n    [{C_WARN}]➜  You can start attacking now from Terminal 2![/]")
-    console.print(f"      [bold white]cat {os.path.abspath('01.deep_tcp_top1000.nmap')}[/]")
+    console.print(f"      [bold white]cat {os.path.abspath('p1.deep_tcp_top1000.nmap')}[/]")
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  T2 — Full port sweep
-    # ═══════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════
+    #  P2 — Full port sweep
+    # ═════════════════════════════════════════════════════════════════════
     time.sleep(3)
-    phase_header("T2 — FULL PORT SWEEP", "nmap -Pn -n -p- -v --open --min-rate 2000  (all 65535 ports)")
-    t2_cmd = [
+    phase_header("P2 — FULL PORT SWEEP", "nmap -Pn -n -p- -v --open --min-rate 2000  (all 65535 ports)")
+    p2_cmd = [
         "nmap", "-Pn", "-n", "-p-", "-v", "--open", "--min-rate", "2000",
-        "-oA", "02.sweep_all_tcp_ports",
+        "-oA", "p2.sweep_all_tcp_ports",
         target,
     ]
-    run_nmap_live(t2_cmd, "T2", "02.sweep_all_tcp_ports", raw_dir_rel, logfile)
+    run_nmap_live(p2_cmd, "P2", "p2.sweep_all_tcp_ports", raw_dir_rel, logfile)
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  T4 — Deep scan on NEW ports only
-    # ═══════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════
+    #  P3 — Deep scan on NEW ports only
+    # ═════════════════════════════════════════════════════════════════════
     time.sleep(3)
-    t2_ports = extract_ports_from_gnmap(os.path.join(raw_dir_rel, "02.sweep_all_tcp_ports.gnmap"))
-    new_ports = sorted(t2_ports - TOP_1000)
+    p2_ports = extract_ports_from_gnmap(os.path.join(raw_dir_rel, "p2.sweep_all_tcp_ports.gnmap"))
+    new_ports = sorted(p2_ports - TOP_1000)
 
-    t4_ran = False
+    p3_ran = False
     if new_ports:
         port_str = ",".join(str(p) for p in new_ports)
-        phase_header("T4 — NEW-PORT DEEP SCAN", f"Deep scan on {len(new_ports)} port(s) not in top-1000: {port_str}")
-        t4_cmd = [
+        phase_header("P3 — NEW-PORT DEEP SCAN", f"Deep scan on {len(new_ports)} port(s) not in top-1000: {port_str}")
+        p3_cmd = [
             "nmap", "-Pn", "-sC", "-sV", "-n", "-v", "--open",
             "-p", port_str,
-            "-oA", "04.deep_tcp_targeted",
+            "-oA", "p3.deep_tcp_targeted",
             target,
         ]
-        run_nmap_live(t4_cmd, "T4", "04.deep_tcp_targeted", raw_dir_rel, logfile)
-        t4_ran = True
+        run_nmap_live(p3_cmd, "P3", "p3.deep_tcp_targeted", raw_dir_rel, logfile)
+        p3_ran = True
     else:
-        phase_header("T4 — SKIPPED", "No new ports found beyond top-1000", C_WARN)
+        phase_header("P3 — SKIPPED", "No new ports found beyond top-1000", C_WARN)
 
-    # ── Close TCP log ──
     logfile.close()
 
-    # ── Wait for UDP if still running ──
+    # ── Wait for UDP ──
     udp_done = udp.poll() is not None
     if not udp_done:
         console.print(f"\n  [{C_INFO}]⏳ Waiting for UDP scan to finish...[/]  [{C_DIM}](Ctrl+C to skip)[/]")
@@ -450,11 +493,16 @@ def main():
 
     move_udp_outputs(raw_dir_rel)
 
-    # ═══════════════════════════════════════════════════════════════════════
+    # ── UDP attack hints ──
+    udp_gnmap = os.path.join(raw_dir_rel, "udp.deep_targeted.gnmap")
+    if udp_done and os.path.exists(udp_gnmap):
+        print_udp_hints(udp_gnmap)
+
+    # ═════════════════════════════════════════════════════════════════════
     #  Summary
-    # ═══════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════
     print_summary(target, os.path.abspath("."), os.path.abspath(raw_dir_rel),
-                  t1_ports, new_ports, t4_ran, udp_done)
+                  p1_ports, new_ports, p3_ran, udp_done)
 
 
 if __name__ == "__main__":
