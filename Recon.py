@@ -223,8 +223,9 @@ def print_port_discovery(port: int, proto: str, phase: str):
 
 
 def run_nmap_live(cmd: list, phase_name: str, oA_base: str, raw_dir: str,
-                  logfile=None, show_ports=True) -> subprocess.Popen:
-    full_cmd = ["sudo"] + cmd if os.geteuid() != 0 else cmd
+                  logfile=None, show_ports=True) -> int:
+    """Run nmap with live output. Returns the exit code."""
+    full_cmd = (["sudo"] + cmd) if os.geteuid() != 0 else cmd
     proc = subprocess.Popen(
         full_cmd,
         stdout=subprocess.PIPE,
@@ -271,9 +272,10 @@ def run_nmap_live(cmd: list, phase_name: str, oA_base: str, raw_dir: str,
         console.print(f"\n    [{C_OK}]✓ {phase_name} complete[/]  "
                        f"[{C_DIM}]({mins}m {secs}s, {port_count} port(s) discovered)[/]")
     else:
-        console.print(f"\n    [{C_ERR}]✗ {phase_name} exited with code {proc.returncode}[/]")
+        console.print(f"\n    [{C_ERR}]✗ {phase_name} FAILED (exit code {proc.returncode})[/]")
+        console.print(f"    [{C_ERR}]  ⚠  Results may be incomplete — check the .nmap file and consider re-running.[/]")
 
-    return proc
+    return proc.returncode
 
 
 def start_udp_background(target: str, raw_dir: str) -> subprocess.Popen:
@@ -287,7 +289,7 @@ def start_udp_background(target: str, raw_dir: str) -> subprocess.Popen:
         "-oA", oA_base,
         target,
     ]
-    full_cmd = ["sudo"] + cmd if os.geteuid() != 0 else cmd
+    full_cmd = (["sudo"] + cmd) if os.geteuid() != 0 else cmd
 
     live_fh = open(live_path, "w")
     udp_proc = subprocess.Popen(
@@ -306,17 +308,24 @@ def move_udp_outputs(raw_dir: str):
 
 
 def print_udp_hints(gnmap_path: str):
-    """Parse UDP .gnmap for open ports and print attack-path hints."""
+    """Parse UDP .gnmap for open ports, display them, and print attack tips."""
     open_ports = extract_ports_from_gnmap(gnmap_path)
     if not open_ports:
         return
 
+    sorted_ports = sorted(open_ports)
+    port_labels = []
+    for p in sorted_ports:
+        svc = UDP_HINTS[p][0] if p in UDP_HINTS else "?"
+        port_labels.append(f"{p}/{svc}")
+    port_summary = ", ".join(port_labels)
+
     console.print()
     console.rule(style=C_HINT)
-    console.print(f"  [{C_HINT}]⚡ UDP ATTACK TIPS[/]")
+    console.print(f"  [{C_HINT}]⚡ UDP RESULTS[/]  —  {len(open_ports)} open port(s) found: [{C_PORT}]{port_summary}[/]")
     console.rule(style=C_HINT)
 
-    for port in sorted(open_ports):
+    for port in sorted_ports:
         if port in UDP_HINTS:
             svc, tools, purpose = UDP_HINTS[port]
             console.print(f"\n    [{C_PORT}]UDP/{port}[/] — [{C_SVC}]{svc}[/]")
@@ -328,7 +337,7 @@ def print_udp_hints(gnmap_path: str):
     console.print()
 
 
-def print_summary(target: str, scan_dir: str, raw_dir: str, p1_ports, p2_new, p3_ran, udp_done):
+def print_summary(target: str, scan_dir: str, raw_dir: str, p1_ports, p2_new, p3_ran, udp_done, p1_rc, p2_rc):
     console.print()
     console.rule(style=C_OK)
 
@@ -343,17 +352,25 @@ def print_summary(target: str, scan_dir: str, raw_dir: str, p1_ports, p2_new, p3
     table.add_column("Status", style="white", min_width=12)
     table.add_column("Quick View", style="dim white", min_width=40)
 
+    p1_status = f"[green]✓[/]  {len(p1_ports)} port(s)" if p1_rc == 0 else "[red]✗ FAILED[/] — check output"
     table.add_row(
         "P1  top-1000",
-        f"[green]✓[/]  {len(p1_ports)} port(s)",
+        p1_status,
         "cat 01.deep_tcp_top1000.nmap",
     )
+    p2_status = "[green]✓[/]" if p2_rc == 0 else "[red]✗ FAILED[/] — re-run sweep"
     table.add_row(
         "P2  full sweep",
-        "[green]✓[/]",
+        p2_status,
         "cat 02.sweep_all_tcp_ports.nmap",
     )
-    if p3_ran:
+    if p2_rc != 0:
+        table.add_row(
+            "P3  new ports",
+            "[red]SKIPPED[/]",
+            "P2 failed — cannot diff ports",
+        )
+    elif p3_ran:
         table.add_row(
             "P3  new ports",
             f"[green]✓[/]  {len(p2_new)} new port(s)",
@@ -365,7 +382,11 @@ def print_summary(target: str, scan_dir: str, raw_dir: str, p1_ports, p2_new, p3
             "[yellow]SKIPPED[/]",
             "no new ports beyond top-1000",
         )
-    udp_status = "[green]✓[/]" if udp_done else "[yellow]running[/]"
+    if udp_done:
+        udp_open = extract_ports_from_gnmap(os.path.join(raw_dir, "03.deep_udp_targeted.gnmap"))
+        udp_status = f"[green]✓[/]  {len(udp_open)} port(s)" if udp_open else "[green]✓[/]  0 port(s)"
+    else:
+        udp_status = "[yellow]still running[/]"
     table.add_row(
         "UDP targeted",
         udp_status,
@@ -435,7 +456,7 @@ def main():
         "-oA", "01.deep_tcp_top1000",
         target,
     ]
-    run_nmap_live(p1_cmd, "P1", "01.deep_tcp_top1000", raw_dir_rel, logfile)
+    p1_rc = run_nmap_live(p1_cmd, "P1", "01.deep_tcp_top1000", raw_dir_rel, logfile)
     p1_ports = extract_ports_from_gnmap(os.path.join(raw_dir_rel, "01.deep_tcp_top1000.gnmap"))
 
     if p1_ports:
@@ -453,7 +474,7 @@ def main():
         "-oA", "02.sweep_all_tcp_ports",
         target,
     ]
-    run_nmap_live(p2_cmd, "P2", "02.sweep_all_tcp_ports", raw_dir_rel, logfile)
+    p2_rc = run_nmap_live(p2_cmd, "P2", "02.sweep_all_tcp_ports", raw_dir_rel, logfile)
 
     # ═════════════════════════════════════════════════════════════════════
     #  P3 — Deep scan on NEW ports only
@@ -463,7 +484,9 @@ def main():
     new_ports = sorted(p2_ports - TOP_1000)
 
     p3_ran = False
-    if new_ports:
+    if p2_rc != 0:
+        phase_header("P3 — SKIPPED", "P2 sweep failed — cannot reliably diff ports. Re-run or sweep manually.", C_ERR)
+    elif new_ports:
         port_str = ",".join(str(p) for p in new_ports)
         phase_header("P3 — NEW-PORT DEEP SCAN", f"Deep scan on {len(new_ports)} port(s) not in top-1000: {port_str}")
         p3_cmd = [
@@ -502,7 +525,7 @@ def main():
     #  Summary
     # ═════════════════════════════════════════════════════════════════════
     print_summary(target, os.path.abspath("."), os.path.abspath(raw_dir_rel),
-                  p1_ports, new_ports, p3_ran, udp_done)
+                  p1_ports, new_ports, p3_ran, udp_done, p1_rc, p2_rc)
 
 
 if __name__ == "__main__":
