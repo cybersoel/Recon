@@ -49,6 +49,9 @@ You enter the target, pick your options with arrow keys, and it handles everythi
 
 ```bash
 sudo python3 Recon.py
+
+# Or fast launch one-liner:
+git clone https://github.com/cybersoel/Recon && cd Recon && chmod +x ./Recon.py && sudo python3 ./Recon.py
 ```
 
 An arrow-key menu appears:
