@@ -152,7 +152,7 @@ Same pipeline as Single Target, but designed for scanning through an active **Li
 ### Network Range
 
 1. **Host Discovery** — `nmap -sn` with ICMP + TCP probes to find live hosts
-2. **Full Port Sweep** — all 65535 TCP ports scanned across every live host (with your selected min-rate)
+2. **Full Port Sweep** — all 65535 TCP ports scanned (without options like -sV -sC) across every live host (with your selected min-rate)
 3. **Interactive Host Selection** — arrow-key menu shows every discovered host with their open ports. Pick one to deep scan. Already-scanned hosts appear as `[DONE]`.
 4. **Per-Host Deep Scan** — targeted deep scan using only the known open ports (split into top-1000 vs non-top-1000) + background UDP
 5. **Repeat** — returns to host selection after each scan. Press `q` when done.
