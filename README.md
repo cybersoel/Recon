@@ -3,6 +3,14 @@
 **Automated Nmap Recon Pipeline**
 By **Soel Kwun** — Developed for Personal Use
 
+I built this for myself to use during CTF exams (CPTS, OSCP) to accelerate the initial nmap scanning workflow, mostly following [ippsec's](https://www.youtube.com/@ippsec) approach. The priorities were:
+
+- **Reliability** — this is your single source of truth for initial enumeration. No gaps, no silently skipped scans. If nmap gets interrupted, the tool detects it and re-runs automatically. I vibe-coded this with Claude, but with extreme care for reliability — if it breaks, I fail the exam.
+- **Simplicity** — just `-sC -sV`, organized output, nothing fancy. Tools like AutoRecon pack in too many features. I wanted something I fully understand and trust.
+- **User experience** — arrow-key menus, clean colored output, attack from Terminal 2 while it runs. Smooth process, good readability.
+
+Feel free to use it for your CTFs.
+
 ---
 
 ## What It Does
@@ -32,46 +40,8 @@ You enter the target, pick your options with arrow keys, and it handles everythi
 
 ## Requirements
 
-- Python 3.8+
-- `nmap`
-- `rich` (Python library — see install options below)
-
-### Installing `rich`
-
-The only external dependency. Pick whatever works for your setup:
-
-**Option 1 — apt (Kali / Debian / Ubuntu)** ⭐ Easiest on Kali
-```bash
-sudo apt install python3-rich
-```
-No pip needed. Already in Kali repos.
-
-**Option 2 — venv (works everywhere, zero system pollution)**
-```bash
-python3 -m venv ~/recon-venv
-source ~/recon-venv/bin/activate
-pip install rich
-```
-Then always run Recon.py from the activated venv:
-```bash
-source ~/recon-venv/bin/activate
-sudo $(which python3) Recon.py
-```
-> **Note:** `sudo python3` won't see venv packages. You need `sudo $(which python3)` to use the venv's python as root. Alternatively: `sudo ~/recon-venv/bin/python3 Recon.py`
-
-**Option 3 — pip with `--break-system-packages` (quick & dirty)**
-```bash
-pip install rich --break-system-packages
-```
-Works on modern Kali/Debian that block pip by default. Fine for a pentest VM you don't care about keeping clean.
-
-**Option 4 — pip install --user**
-```bash
-pip install --user rich
-```
-Installs to `~/.local/lib/python3.x/`. May not be visible to sudo — same `sudo $(which python3)` trick from Option 2 applies.
-
-> **Note:** `pipx` won't work here. It's designed for runnable CLI tools, not importable libraries.
+- Python 3.8+, `nmap`, `rich` (`sudo apt install python3-rich` or `pip install rich --break-system-packages`)
+- If using a venv or `--user` install, run with `sudo $(which python3) Recon.py` so sudo sees the packages
 
 ---
 
@@ -152,7 +122,7 @@ Same pipeline as Single Target, but designed for scanning through an active **Li
 ### Network Range
 
 1. **Host Discovery** — `nmap -sn` with ICMP + TCP probes to find live hosts
-2. **Full Port Sweep** — all 65535 TCP ports scanned (without options like -sV -sC) across every live host (with your selected min-rate)
+2. **Full Port Sweep** — all 65535 TCP ports scanned without deep options (no `-sC -sV`, just open port detection) across every live host (with your selected min-rate)
 3. **Interactive Host Selection** — arrow-key menu shows every discovered host with their open ports. Pick one to deep scan. Already-scanned hosts appear as `[DONE]`.
 4. **Per-Host Deep Scan** — targeted deep scan using only the known open ports (split into top-1000 vs non-top-1000) + background UDP
 5. **Repeat** — returns to host selection after each scan. Press `q` when done.
