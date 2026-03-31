@@ -123,7 +123,9 @@ TOP_1000 = {
 }
 
 # TCP ports used for host discovery in pivot mode (no ICMP available)
-PIVOT_DISCOVERY_PORTS = "22,80,135,139,443,445,3389,5985,8080,8443"
+# Covers: Linux (21,22,80,443,8080,8443), Windows (135,139,445,3389,5985),
+#         Active Directory DCs (53,88,389), databases (1433)
+PIVOT_DISCOVERY_PORTS = "21,22,53,80,88,135,139,389,443,445,1433,3389,5985,8080,8443"
 
 # ─── Colors / Theming ───────────────────────────────────────────────────────
 C_PHASE = "bold cyan"
@@ -525,9 +527,81 @@ def curses_select_resume(phase_name: str):
         sys.exit(130)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  RICH HELPERS — banner, prompts, formatting
-# ═══════════════════════════════════════════════════════════════════════════
+def curses_few_hosts_prompt(hosts: list, pivot: bool):
+    """When <3 hosts found, recommend Single Target mode. Returns 'single' or 'continue'."""
+    mode_label = "Single Target (Pivot)" if pivot else "Single Target"
+
+    def _run(stdscr):
+        curses.curs_set(0)
+        _init_colors()
+        selected = 0  # default to recommended option
+
+        options = [
+            (f"Switch to {mode_label} mode  (recommended)", "single"),
+            ("Continue with Network Range scan",            "continue"),
+        ]
+
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            y = 1
+
+            try:
+                stdscr.addnstr(y, 2, f"Only {len(hosts)} host(s) discovered",
+                               w - 3, curses.color_pair(4) | curses.A_BOLD)
+                y += 1
+                stdscr.addnstr(y, 2, "-" * 50, w - 3, curses.color_pair(6))
+                y += 2
+
+                for ip in hosts:
+                    stdscr.addnstr(y, 4, ip, w - 5, curses.color_pair(1) | curses.A_BOLD)
+                    y += 1
+
+                y += 1
+                stdscr.addnstr(y, 2, f"{mode_label} mode gets you attacking faster —",
+                               w - 3, curses.color_pair(2))
+                y += 1
+                stdscr.addnstr(y, 2, "P1 deep scan runs immediately instead of waiting",
+                               w - 3, curses.color_pair(6))
+                y += 1
+                stdscr.addnstr(y, 2, "for a full port sweep across all hosts first.",
+                               w - 3, curses.color_pair(6))
+                y += 2
+            except curses.error:
+                pass
+
+            for i, (label, _) in enumerate(options):
+                try:
+                    if i == selected:
+                        stdscr.addnstr(y, 2, "> " + label, w - 3,
+                                       curses.color_pair(1) | curses.A_BOLD)
+                    else:
+                        stdscr.addnstr(y, 2, "  " + label, w - 3, curses.color_pair(2))
+                except curses.error:
+                    pass
+                y += 1
+
+            y += 2
+            try:
+                stdscr.addnstr(min(y, h - 1), 2, "[Up/Down] Navigate   [Enter] Select",
+                               w - 3, curses.color_pair(6))
+            except curses.error:
+                pass
+
+            stdscr.refresh()
+            key = stdscr.getch()
+
+            if key == curses.KEY_UP:
+                selected = max(0, selected - 1)
+            elif key == curses.KEY_DOWN:
+                selected = min(len(options) - 1, selected + 1)
+            elif key in (curses.KEY_ENTER, 10, 13):
+                return options[selected][1]
+
+    try:
+        return curses.wrapper(_run)
+    except KeyboardInterrupt:
+        sys.exit(130)
 udp_proc = None
 
 
@@ -1065,8 +1139,26 @@ def pipeline_network(cidr: str, minrate: int, pivot: bool):
     for ip in live_hosts:
         console.print(f"      [{C_PORT}]{ip}[/]")
 
-    # ═══ PHASE 2 — Full Port Sweep (all hosts) ═══
+    # ── Few hosts? Recommend Single Target mode ──
     sweep_gnmap = os.path.join(raw_dir_rel, "03.sweep_allhosts_all_tcp_ports.gnmap")
+    if len(live_hosts) < 3 and not is_scan_complete(sweep_gnmap):
+        choice = curses_few_hosts_prompt(live_hosts, pivot)
+        if choice == "single":
+            mode_label = "Single Target (Pivot)" if pivot else "Single Target"
+            console.print()
+            console.rule(style=C_INFO)
+            console.print(f"  [{C_INFO}]Switching to {mode_label} mode[/]")
+            console.print(f"  [{C_DIM}]Run Recon.py once per host:[/]")
+            console.print()
+            for ip in live_hosts:
+                console.print(f"    [bold white]sudo python3 Recon.py[/]  [{C_DIM}]→ {mode_label} → {ip}[/]")
+            console.print()
+            console.rule(style=C_INFO)
+            console.print()
+            os.chdir(start_cwd)
+            return
+
+    # ═══ PHASE 2 — Full Port Sweep (all hosts) ═══
     if is_scan_complete(sweep_gnmap):
         console.print(f"\n  [{C_OK}]+ Sweep results exist — skipping.[/]")
     else:
