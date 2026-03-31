@@ -49,9 +49,6 @@ You enter the target, pick your options with arrow keys, and it handles everythi
 
 ```bash
 sudo python3 Recon.py
-
-# Or fast launch one-liner:
-git clone https://github.com/cybersoel/Recon && cd Recon && chmod +x ./Recon.py && sudo python3 ./Recon.py
 ```
 
 An arrow-key menu appears:
@@ -125,6 +122,7 @@ Same pipeline as Single Target, but designed for scanning through an active **Li
 ### Network Range
 
 1. **Host Discovery** — `nmap -sn` with ICMP + TCP probes to find live hosts
+   - If fewer than 3 hosts are found, the tool recommends switching to **Single Target** mode — gets you attacking faster since P1 deep scan runs immediately instead of waiting for a full port sweep first
 2. **Full Port Sweep** — all 65535 TCP ports scanned without deep options (no `-sC -sV`, just open port detection) across every live host (with your selected min-rate)
 3. **Interactive Host Selection** — arrow-key menu shows every discovered host with their open ports. Pick one to deep scan. Already-scanned hosts appear as `[DONE]`.
 4. **Per-Host Deep Scan** — targeted deep scan using only the known open ports (split into top-1000 vs non-top-1000) + background UDP
@@ -134,7 +132,7 @@ Same pipeline as Single Target, but designed for scanning through an active **Li
 
 Same as Network Range, but:
 
-- Host discovery uses **TCP probes** (`-PS22,80,135,139,443,445,3389,5985,8080,8443`) instead of ICMP — ping/ICMP is typically disabled on internal networks
+- Host discovery uses **TCP probes** (`-PS21,22,53,80,88,135,139,389,443,445,1433,3389,5985,8080,8443`) instead of ICMP — covers Linux (21,22,80), Windows (135,445,3389,5985), Active Directory DCs (53,88,389), databases (1433), and web services (443,8080,8443)
 - All TCP scans include `--unprivileged` and `-n`
 - No min-rate option
 
@@ -222,6 +220,8 @@ These are quick reminders, not full guides. Check HackTricks or your notes for d
 - **4 scan modes** with interactive arrow-key selection (curses-based menu)
 - **Ligolo-ng pivot support** — `--unprivileged`, `-n`, no min-rate, TCP-based host discovery
 - **Network range scanning** — host discovery, full sweep, interactive per-host deep scan
+- **Smart few-hosts routing** — when network discovery finds <3 hosts, recommends switching to Single Target mode for faster time-to-attack
+- **Expanded pivot discovery ports** — 15 TCP ports covering Linux, Windows, Active Directory (Kerberos/LDAP/DNS), and databases (MSSQL)
 - **Min-rate selection** — choose scan speed per environment (disabled / 500 / 2000 / 4000)
 - **Resume detection** — validates scan completion before skipping; partial scans are re-run
 - **Pivot-aware phase headers** — added flags shown in red so you know exactly what's running
