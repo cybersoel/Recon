@@ -147,6 +147,125 @@ TOP_1000 = {
 #         Active Directory DCs (53,88,389), databases (1433)
 PIVOT_DISCOVERY_PORTS = "21,22,53,80,88,135,139,389,443,445,1433,3389,5985,8080,8443"
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  TARGET PRIORITIZATION  (CTF / pentest heuristics — the tool's own judgment)
+# ═══════════════════════════════════════════════════════════════════════════
+# Scores a host from its open TCP ports purely to ORDER the deep-scan queue and
+# justify that order with a one-line reason. NOTHING about reliability depends on
+# this — every queued host is still scanned in full regardless of its tier.
+
+_WEB_PORTS   = {80, 443, 591, 3000, 5000, 7080, 7443, 8000, 8008, 8080, 8081,
+                8085, 8090, 8180, 8280, 8443, 8531, 8834, 8888, 9000, 9090, 9443, 10000}
+_SMB_PORTS   = {139, 445}
+_LDAP_PORTS  = {389, 636, 3268, 3269}
+_KERBEROS    = 88
+_WINRM_PORTS = {5985, 5986}
+_RDP_PORT    = 3389
+_SSH_PORT    = 22
+_FTP_PORT    = 21
+_TELNET_PORT = 23
+_MAIL_PORTS  = {25, 110, 143, 465, 587, 993, 995}
+_DB_PORTS    = {1433, 1521, 3306, 5432, 6379, 27017, 27018, 5984, 9200, 11211, 1830, 50000}
+_DB_NAMES    = {1433: "MSSQL", 1521: "Oracle", 3306: "MySQL", 5432: "Postgres",
+                6379: "Redis", 27017: "Mongo", 27018: "Mongo", 5984: "CouchDB",
+                9200: "Elastic", 11211: "Memcached", 1830: "Oracle", 50000: "DB2"}
+
+_KNOWN_PORTS = (_WEB_PORTS | _SMB_PORTS | _LDAP_PORTS | _WINRM_PORTS | _DB_PORTS
+                | _MAIL_PORTS | {_KERBEROS, _RDP_PORT, _SSH_PORT, _FTP_PORT, _TELNET_PORT})
+
+_TIER_RANK = {"CRIT": 0, "HIGH": 1, "MED": 2, "LOW": 3}
+
+
+def _db_label(db_ports) -> str:
+    seen, out = set(), []
+    for p in sorted(db_ports):
+        n = _DB_NAMES.get(p, "DB")
+        if n not in seen:
+            seen.add(n); out.append(n)
+    return "/".join(out[:2])
+
+
+def _score_host(ports: set):
+    """
+    Judge a host's attack priority from its open TCP ports.
+    Returns (score:int, tier:str, reason:str).  Tiers: CRIT > HIGH > MED > LOW.
+
+    Rationale (typical CTF / internal-pentest value):
+      * Domain Controller (Kerberos+LDAP) — crown jewel of an AD environment.
+      * Web / SMB / DB / RDP / WinRM       — usual foothold + lateral-movement surface.
+      * FTP / Telnet                       — anonymous / weak-cred vectors worth a look.
+      * SSH alone                          — no free surface without creds → lowest.
+    A host with 3+ big roles (e.g. SMB + web + DB) is also treated as CRIT.
+    Scoring is TCP-only (UDP is scanned per host separately).
+    """
+    p = set(ports)
+    web      = sorted(p & _WEB_PORTS)
+    smb      = bool(p & _SMB_PORTS)
+    ldap     = bool(p & _LDAP_PORTS)
+    kerberos = _KERBEROS in p
+    db       = sorted(p & _DB_PORTS)
+    rdp      = _RDP_PORT in p
+    winrm    = bool(p & _WINRM_PORTS)
+    ssh      = _SSH_PORT in p
+    ftp      = _FTP_PORT in p
+    telnet   = _TELNET_PORT in p
+    mail     = bool(p & _MAIL_PORTS)
+    is_dc    = kerberos and ldap
+
+    roles, score = [], 0
+
+    if is_dc:
+        roles.append("DC: Kerberos+LDAP"); score += 1000
+    if smb:
+        if not is_dc:
+            roles.append("SMB")
+        score += 200
+    if web:
+        roles.append(f"{len(web)} web svc" if len(web) > 1 else "web server")
+        score += 180 + min(len(web) - 1, 5) * 20
+    if db:
+        roles.append(_db_label(db)); score += 170 + (len(db) - 1) * 30
+    if rdp:
+        roles.append("RDP"); score += 150
+    if winrm:
+        if not rdp:
+            roles.append("WinRM")
+        score += 90
+    if ftp:
+        roles.append("FTP"); score += 90
+    if telnet:
+        roles.append("Telnet"); score += 85
+    if mail:
+        if not roles:
+            roles.append("mail")
+        score += 40
+    if ssh:
+        score += 50
+        if not roles:
+            roles.append("SSH")
+
+    others = len(p - _KNOWN_PORTS)
+    score += min(others, 25) * 3
+
+    remote_exec = rdp or winrm  # count RDP+WinRM once — both are "remote exec to Windows"
+    big_roles = sum([smb, bool(web), bool(db), remote_exec]) + (2 if is_dc else 0)
+    if is_dc or big_roles >= 3:
+        tier = "CRIT"
+    elif big_roles >= 1:
+        tier = "HIGH"
+    elif ftp or telnet or mail:
+        tier = "MED"
+    elif ssh:
+        tier = "MED" if len(p) >= 2 else "LOW"
+    else:
+        tier = "MED" if len(p) >= 3 else "LOW"
+
+    if not roles:
+        roles.append(f"{len(p)} misc port(s)" if p else "none in sweep — re-verify")
+    reason = " + ".join(roles[:3])
+    return score, tier, reason
+
+
 # ─── Colors / Theming ───────────────────────────────────────────────────────
 C_PHASE = "bold cyan"
 C_OK    = "bold green"
@@ -345,160 +464,225 @@ def curses_select_minrate():
         sys.exit(130)
 
 
-def curses_select_host(hosts_ports: dict, completed: set):
-    """
-    Interactive host selector for network mode.
-    hosts_ports: {ip: set_of_open_ports}
-    completed:   set of IPs already scanned
-    Returns: selected IP string, or None to quit.
-    """
-    sorted_hosts = sorted(hosts_ports.keys(), key=lambda x: ipaddress.IPv4Address(x))
-    if not sorted_hosts:
-        return None
+def curses_yes_no(question: str, default_yes: bool = True) -> bool:
+    """Simple Yes/No prompt. Returns True/False."""
+    def _run(stdscr):
+        curses.curs_set(0)
+        _init_colors()
+        sel = 0 if default_yes else 1
+        options = ["Yes", "No"]
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            try:
+                stdscr.addnstr(1, 2, question, w - 3, curses.color_pair(1) | curses.A_BOLD)
+                stdscr.addnstr(2, 2, "-" * min(len(question), w - 4), w - 3, curses.color_pair(6))
+            except curses.error:
+                pass
+            for i, opt in enumerate(options):
+                y = 4 + i
+                attr = (curses.color_pair(1) | curses.A_BOLD) if i == sel else curses.color_pair(2)
+                try:
+                    stdscr.addnstr(y, 2, ("> " if i == sel else "  ") + opt, w - 3, attr)
+                except curses.error:
+                    pass
+            try:
+                stdscr.addnstr(7, 2, "[Up/Down] Navigate   [Enter] Select   [y/n] Quick",
+                               w - 3, curses.color_pair(6))
+            except curses.error:
+                pass
+            stdscr.refresh()
+            k = stdscr.getch()
+            if k in (curses.KEY_UP, curses.KEY_DOWN):
+                sel = 1 - sel
+            elif k in (ord('y'), ord('Y')):
+                return True
+            elif k in (ord('n'), ord('N')):
+                return False
+            elif k in (curses.KEY_ENTER, 10, 13):
+                return sel == 0
+    try:
+        return curses.wrapper(_run)
+    except KeyboardInterrupt:
+        return False
 
-    def _format_ports_lines(ports, avail_width):
-        """Format port list into up to 2 lines that fit within avail_width each.
-        Returns (line1, line2) where line2 may be empty."""
-        s = sorted(ports)
-        if not s:
-            return "(none in sweep — will re-verify)", ""
-        line1 = ""
-        cutoff = None
-        for i, p in enumerate(s):
-            addition = str(p) if i == 0 else f", {p}"
-            remaining = len(s) - (i + 1)
-            reserve = 5 if remaining > 0 else 0
-            if len(line1) + len(addition) + reserve > avail_width and i > 0:
-                cutoff = i
-                break
-            line1 += addition
-        if cutoff is None:
-            return line1, ""
-        # Build line2 from remaining ports
-        leftover = s[cutoff:]
-        line2 = ""
-        for i, p in enumerate(leftover):
-            addition = str(p) if i == 0 else f", {p}"
-            remaining = len(leftover) - (i + 1)
-            reserve = 5 if remaining > 0 else 0
-            if len(line2) + len(addition) + reserve > avail_width and i > 0:
-                line2 += ", ..."
-                return line1, line2
-            line2 += addition
-        return line1, line2
+
+def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
+    """
+    Priority-sorted target cockpit for network mode.
+
+      hosts_ports : {ip: set_of_open_ports}
+      priorities  : {ip: (score, tier, reason)}
+      order       : list of IPs in current display/scan order (mutated in place)
+      excluded    : set of user-excluded IPs (mutated in place)
+      completed   : set of already-scanned IPs
+
+    Controls:
+      Up/Down (k/j)        move cursor
+      Shift+Up/Down (K/J)  move the highlighted host up/down in the scan order
+      space / x            toggle exclude (grey out)
+      enter                SCAN all non-excluded, non-done hosts top-to-bottom
+      r                    reset order to the tool's priority sort
+      q / esc              exit (caller then offers to save the list)
+
+    Returns dict: {"action": "scan"|"exit", "scan_order": [...],
+                   "order": [...], "excluded": set(...)}
+    """
+    tier_pair = {"CRIT": 5, "HIGH": 4, "MED": 1, "LOW": 6}
 
     def _run(stdscr):
         curses.curs_set(0)
         _init_colors()
-        selected = 0
-        scroll = 0
-
-        # Skip to first non-completed host by default
-        for i, ip in enumerate(sorted_hosts):
-            if ip not in completed:
-                selected = i
+        cursor = 0
+        for i, ip in enumerate(order):
+            if ip not in completed and ip not in excluded:
+                cursor = i
                 break
+        scroll = 0
+        msg = ""
 
         while True:
             stdscr.erase()
             h, w = stdscr.getmaxyx()
+            total = len(order)
 
-            # Header
-            total = len(sorted_hosts)
-            done  = len(completed & set(sorted_hosts))
+            # ── Header + tier tally ──
+            tally = {"CRIT": 0, "HIGH": 0, "MED": 0, "LOW": 0}
+            for ip in order:
+                tally[priorities[ip][1]] += 1
+            n_excl = len(excluded & set(order))
+            n_done = len(completed & set(order))
             try:
-                stdscr.addnstr(1, 2, f"Select Target for Deep Scan  ({done}/{total} completed)",
+                stdscr.addnstr(1, 2, "Target Queue — auto-prioritized for deep scan",
                                w - 3, curses.color_pair(1) | curses.A_BOLD)
-                stdscr.addnstr(2, 2, "-" * 50, w - 3, curses.color_pair(6))
+                summary = (f"{total} hosts    "
+                           f"CRIT {tally['CRIT']}  HIGH {tally['HIGH']}  "
+                           f"MED {tally['MED']}  LOW {tally['LOW']}    "
+                           f"excluded {n_excl}   done {n_done}")
+                stdscr.addnstr(2, 2, summary, w - 3, curses.color_pair(6))
             except curses.error:
                 pass
 
-            # Scrollable list — 2 rows per host (line1: IP + ports, line2: overflow ports)
-            ROWS_PER_HOST = 2
-            list_start_y = 4
-            visible_rows = h - list_start_y - 3  # leave room for footer
-            visible = max(1, visible_rows // ROWS_PER_HOST)
+            list_start = 4
+            footer_rows = 4
+            visible = max(1, h - list_start - footer_rows)
 
-            # Adjust scroll
-            if selected < scroll:
-                scroll = selected
-            if selected >= scroll + visible:
-                scroll = selected - visible + 1
-
-            # Column where "ports: " value starts (for line2 alignment)
-            # "> " (2) + IP (16) + " -- " (4) + "NNN ports: " (11) = 33 from col 4
-            indent2 = 4 + 16 + 4 + 11  # = 35
+            if cursor < scroll:
+                scroll = cursor
+            if cursor >= scroll + visible:
+                scroll = cursor - visible + 1
 
             for idx in range(scroll, min(scroll + visible, total)):
-                y = list_start_y + (idx - scroll) * ROWS_PER_HOST
-                ip = sorted_hosts[idx]
-                ports = hosts_ports[ip]
+                y = list_start + (idx - scroll)
+                ip = order[idx]
+                score, tier, reason = priorities[ip]
+                is_excl = ip in excluded
                 is_done = ip in completed
-                count = len(ports)
+                pcount = len(hosts_ports[ip])
+                is_cur = (idx == cursor)
 
-                # Available width for port list on each line
-                prefix_len = 35
-                done_suffix_len = 9 if is_done else 0
-                port_avail = max(10, w - 4 - prefix_len - done_suffix_len - 1)
-                port_avail2 = max(10, w - indent2 - 1)
-                port_line1, port_line2 = _format_ports_lines(ports, port_avail)
+                if is_done:
+                    base = curses.color_pair(3)
+                elif is_excl:
+                    base = curses.color_pair(6)
+                else:
+                    base = curses.color_pair(2)
+                if is_cur:
+                    base |= curses.A_BOLD
 
-                # If line2 overflows its own width, re-truncate
-                if port_line2 and len(port_line2) > port_avail2:
-                    port_line2 = port_line2[:port_avail2 - 4] + " ..."
+                cur_mark = ">" if is_cur else " "
+                badge = f"[{tier:<4}]"
+                tag = "  [done]" if is_done else ("  [excluded]" if is_excl else "")
 
                 try:
-                    if is_done:
-                        marker = "[DONE] "
-                        if idx == selected:
-                            stdscr.addnstr(y, 2, "> ", w - 3, curses.color_pair(3) | curses.A_BOLD)
-                            line = f"{ip:<16} -- {count:>3} ports: {port_line1}  {marker}"
-                            stdscr.addnstr(y, 4, line, w - 5, curses.color_pair(3))
-                        else:
-                            line = f"  {ip:<16} -- {count:>3} ports: {port_line1}  {marker}"
-                            stdscr.addnstr(y, 2, line, w - 3, curses.color_pair(6))
-                        if port_line2 and y + 1 < h - 2:
-                            stdscr.addnstr(y + 1, indent2, port_line2, w - indent2 - 1,
-                                           curses.color_pair(3) if idx == selected else curses.color_pair(6))
+                    stdscr.addnstr(y, 1, cur_mark, 1,
+                                   (curses.color_pair(1) | curses.A_BOLD) if is_cur else base)
+                    stdscr.addnstr(y, 3, f"{idx + 1:>2}", 2, base)
+                    if is_excl or is_done:
+                        badge_attr = base
                     else:
-                        if idx == selected:
-                            stdscr.addnstr(y, 2, "> ", w - 3, curses.color_pair(1) | curses.A_BOLD)
-                            line = f"{ip:<16} -- {count:>3} ports: {port_line1}"
-                            stdscr.addnstr(y, 4, line, w - 5, curses.color_pair(1) | curses.A_BOLD)
-                        else:
-                            line = f"  {ip:<16} -- {count:>3} ports: {port_line1}"
-                            stdscr.addnstr(y, 2, line, w - 3, curses.color_pair(2))
-                        if port_line2 and y + 1 < h - 2:
-                            stdscr.addnstr(y + 1, indent2, port_line2, w - indent2 - 1,
-                                           curses.color_pair(1) if idx == selected else curses.color_pair(6))
+                        badge_attr = curses.color_pair(tier_pair[tier]) | (curses.A_BOLD if is_cur else 0)
+                    stdscr.addnstr(y, 6, badge, 6, badge_attr)
+                    stdscr.addnstr(y, 13, f"{ip:<15}", 15, base)
+                    stdscr.addnstr(y, 29, f"{pcount:>3}", 3, base)
+                    rx = 33
+                    avail = max(4, w - rx - 1)
+                    text = reason
+                    if len(text) + len(tag) > avail:
+                        text = text[:max(1, avail - len(tag) - 1)] + "~"
+                    stdscr.addnstr(y, rx, (text + tag)[:avail], avail, base)
                 except curses.error:
                     pass
 
-            # Footer
-            footer_y = min(list_start_y + visible * ROWS_PER_HOST + 1, h - 1)
+            # ── Detail: ports of the highlighted host ──
+            detail_y = list_start + visible
+            if 0 <= cursor < total:
+                ip = order[cursor]
+                ports = sorted(hosts_ports[ip])
+                plist = ", ".join(str(x) for x in ports) if ports else "(none in sweep — re-verified at scan time)"
+                try:
+                    stdscr.addnstr(detail_y, 2, "-" * max(0, min(w - 4, 72)), w - 3, curses.color_pair(6))
+                    label = f"{ip}  open: "
+                    stdscr.addnstr(detail_y + 1, 2, label, w - 3, curses.color_pair(1))
+                    stdscr.addnstr(detail_y + 1, 2 + len(label), plist,
+                                   max(1, w - 3 - len(label)), curses.color_pair(2))
+                except curses.error:
+                    pass
+
+            # ── Footer ──
+            fy = detail_y + 2
             try:
-                stdscr.addnstr(footer_y, 2,
-                               "[Up/Down] Navigate   [Enter] Scan selected   [q] Done / Exit",
-                               w - 3, curses.color_pair(6))
+                if msg:
+                    stdscr.addnstr(fy, 2, msg, w - 3, curses.color_pair(4) | curses.A_BOLD)
+                keys = ("[Up/Dn] move   [K/J] reorder   [space] exclude   "
+                        "[Enter] SCAN ALL   [r] reset   [q] exit")
+                stdscr.addnstr(min(fy + 1, h - 1), 2, keys, w - 3, curses.color_pair(6))
             except curses.error:
                 pass
 
             stdscr.refresh()
             key = stdscr.getch()
+            msg = ""
 
-            if key == curses.KEY_UP:
-                selected = max(0, selected - 1)
-            elif key == curses.KEY_DOWN:
-                selected = min(total - 1, selected + 1)
+            if key in (curses.KEY_UP, ord('k')):
+                cursor = max(0, cursor - 1)
+            elif key in (curses.KEY_DOWN, ord('j')):
+                cursor = min(total - 1, cursor + 1)
+            elif key in (curses.KEY_SR, ord('K')):
+                if cursor > 0:
+                    order[cursor - 1], order[cursor] = order[cursor], order[cursor - 1]
+                    cursor -= 1
+            elif key in (curses.KEY_SF, ord('J')):
+                if cursor < total - 1:
+                    order[cursor + 1], order[cursor] = order[cursor], order[cursor + 1]
+                    cursor += 1
+            elif key in (ord(' '), ord('x'), ord('X')):
+                ip = order[cursor]
+                if ip in completed:
+                    msg = f"{ip} already scanned — can't exclude a completed host."
+                elif ip in excluded:
+                    excluded.discard(ip)
+                else:
+                    excluded.add(ip)
+            elif key in (ord('r'), ord('R')):
+                order.sort(key=lambda x: (_TIER_RANK[priorities[x][1]], -priorities[x][0],
+                                          ipaddress.IPv4Address(x)))
+                msg = "Order reset to priority sort."
             elif key in (curses.KEY_ENTER, 10, 13):
-                return sorted_hosts[selected]
+                scan_order = [ip for ip in order if ip not in excluded and ip not in completed]
+                if not scan_order:
+                    msg = "Nothing to scan — every host is excluded or already done."
+                else:
+                    return {"action": "scan", "scan_order": scan_order,
+                            "order": order, "excluded": excluded}
             elif key in (ord('q'), ord('Q'), 27):
-                return None
+                return {"action": "exit", "scan_order": [],
+                        "order": order, "excluded": excluded}
 
     try:
         return curses.wrapper(_run)
     except KeyboardInterrupt:
-        return None
+        return {"action": "exit", "scan_order": [], "order": order, "excluded": excluded}
 
 
 def curses_select_resume(phase_name: str):
@@ -796,8 +980,10 @@ def print_port_discovery(port: int, proto: str, phase: str):
 
 
 def run_nmap_live(cmd: list, phase_name: str, oA_base: str, raw_dir: str,
-                  logfile=None, show_ports=True) -> int:
-    """Run nmap with live output. Returns exit code."""
+                  logfile=None, show_ports=True, terse=False) -> int:
+    """Run nmap with live output. Returns exit code.
+    terse=True suppresses the dim progress/script chatter (keeps discovered-port
+    lines + the completion summary) — used during network autoscan."""
     full_cmd = (["sudo"] + cmd) if os.geteuid() != 0 else cmd
     proc = subprocess.Popen(
         full_cmd,
@@ -825,11 +1011,13 @@ def run_nmap_live(cmd: list, phase_name: str, oA_base: str, raw_dir: str,
                 continue
 
         if "About " in stripped and "done" in stripped:
-            console.print(f"    [{C_DIM}]{stripped.strip()}[/]")
+            if not terse:
+                console.print(f"    [{C_DIM}]{stripped.strip()}[/]")
             continue
 
         if any(k in stripped for k in ["Service Info:", "SF:", "|_", "|  "]):
-            console.print(f"    [{C_DIM}]{stripped.strip()}[/]")
+            if not terse:
+                console.print(f"    [{C_DIM}]{stripped.strip()}[/]")
 
     proc.wait()
     elapsed = time.time() - start
@@ -1375,30 +1563,64 @@ def pipeline_network(cidr: str, minrate: int, pivot: bool):
                   f"({total_ports} total); all {len(hosts_ports)} live host(s) selectable")
     console.print(f"    [{C_DIM}]  Each deep scan re-verifies its host, so sweep misses don't propagate.[/]")
 
-    # ═══ PHASE 3 — Interactive Per-Host Deep Scan Loop ═══
+    # ═══ PHASE 3 — Priority-sorted target queue → autoscan ═══
     completed_hosts = _detect_completed_hosts(hosts_ports)
 
+    # The tool's own judgment: score + tier + reason per host (CTF/pentest heuristics),
+    # then sort the queue highest-priority-first. Ordering only — every queued host
+    # is still scanned in full.
+    priorities = {ip: _score_host(ports) for ip, ports in hosts_ports.items()}
+    order = sorted(hosts_ports.keys(),
+                   key=lambda ip: (_TIER_RANK[priorities[ip][1]], -priorities[ip][0],
+                                   ipaddress.IPv4Address(ip)))
+    excluded = set()
+
     while True:
-        target_ip = curses_select_host(hosts_ports, completed_hosts)
-        if target_ip is None:
-            break
+        result = curses_target_manager(hosts_ports, priorities, order, excluded, completed_hosts)
+        order = result["order"]
+        excluded = result["excluded"]
 
-        if target_ip in completed_hosts:
-            console.print(f"\n  [{C_WARN}]{target_ip} was already scanned. Re-scanning will overwrite results.[/]")
+        if result["action"] == "scan":
+            scan_order = result["scan_order"]
+            total = len(scan_order)
+            console.print()
+            console.rule(style=C_PHASE)
+            console.print(f"  [{C_PHASE}]> AUTOSCAN[/]  —  {total} host(s), highest priority first   "
+                          f"[{C_DIM}](each host: P1 top-1000 → P2 full re-sweep → P3; Ctrl+C skips the rest)[/]")
+            console.rule(style=C_PHASE)
 
-        _scan_single_host_from_sweep(target_ip, hosts_ports[target_ip], pivot)
-        completed_hosts.add(target_ip)
+            try:
+                for i, ip in enumerate(scan_order, 1):
+                    _scan_single_host_from_sweep(ip, hosts_ports[ip], pivot,
+                                                 batch=(i, total), pri=priorities[ip])
+                    completed_hosts.add(ip)
+            except KeyboardInterrupt:
+                # Let the user bail out of the batch but keep what finished.
+                console.print(f"\n  [{C_WARN}]Autoscan interrupted — returning to the target queue.[/]")
+                time.sleep(1)
+                continue
 
-        remaining = len(hosts_ports) - len(completed_hosts & set(hosts_ports.keys()))
-        if remaining > 0:
-            console.print(f"\n  [{C_INFO}]{remaining} host(s) remaining. Returning to host selection...[/]")
-            time.sleep(2)
-        else:
-            console.print(f"\n  [{C_OK}]+ All hosts scanned![/]")
-            break
+            remaining = [ip for ip in order if ip not in excluded and ip not in completed_hosts]
+            if remaining:
+                console.print(f"\n  [{C_INFO}]{len(remaining)} host(s) still unscanned. "
+                              f"Returning to the target queue...[/]")
+                time.sleep(2)
+                continue
+            console.print(f"\n  [{C_OK}]+ All queued hosts scanned.[/]")
+
+        # ── action == "exit"  (or the autoscan drained the queue) ──
+        pending = [ip for ip in order if ip not in completed_hosts and ip not in excluded]
+        save = curses_yes_no(
+            "Save this auto-prioritized target list to a file? "
+            "(handy for scanning remaining hosts individually later)",
+            default_yes=bool(pending))
+        if save:
+            path = _save_target_list(cidr, order, excluded, priorities, hosts_ports, completed_hosts)
+            console.print(f"\n  [{C_OK}]+ Target list saved:[/]  [bold white]{os.path.abspath(path)}[/]")
+        break
 
     # ── Network summary ──
-    _print_network_summary(cidr, os.path.abspath("."), hosts_ports, completed_hosts, pivot)
+    _print_network_summary(cidr, os.path.abspath("."), hosts_ports, completed_hosts, pivot, priorities)
     os.chdir(start_cwd)
 
 
@@ -1415,16 +1637,20 @@ def _detect_completed_hosts(hosts_ports: dict) -> set:
     return completed
 
 
-def _scan_single_host_from_sweep(target: str, known_ports: set, pivot: bool):
+def _scan_single_host_from_sweep(target, known_ports, pivot, batch=None, pri=None):
     """
     Deep scan a single host — AUTHORITATIVE and independent of the aggregate
-    network sweep, so a miss in the fast all-hosts sweep can't reach the result.
+    network sweep (a miss in the fast all-hosts sweep can't reach the result).
 
       P1: careful -sC -sV on nmap's DEFAULT top-1000  (guarantees common ports)
-      P2: full -p- re-sweep of THIS host, default adaptive timing, NO --min-rate
-          (aggressive rates are what drop SYN/ACKs and cause missed ports)
-      P3: careful -sC -sV on any ports beyond the top-1000
-          (union of aggregate-sweep hits and this host's fresh -p- results)
+      P2: full -p- re-sweep of THIS host, default timing, NO --min-rate
+      P3: careful -sC -sV on ports beyond the top-1000 (union of sweep + P2)
+
+    Output here is the terse "autoscan" style: only the essence (phase markers,
+    open ports, the exact cat command to attack now, and any port the aggregate
+    sweep missed). Full nmap detail lives in the .nmap files. Reliability is
+    identical to the verbose path — only verbosity changes.
+    batch = (idx, total) for the "[i/n]" header; pri = (score, tier, reason).
     """
     host_dir = target
     raw_dir = os.path.join(host_dir, "raw")
@@ -1434,16 +1660,21 @@ def _scan_single_host_from_sweep(target: str, known_ports: set, pivot: bool):
     os.chdir(host_dir)
     raw_dir_rel = "raw"
 
+    # ── Compact host header ──
+    tier = pri[1] if pri else ""
+    reason = pri[2] if pri else ""
+    tier_c = {"CRIT": C_ERR, "HIGH": C_WARN, "MED": C_INFO, "LOW": C_DIM}.get(tier, C_INFO)
+    bt = f"[{batch[0]}/{batch[1]}] " if batch else ""
     console.print()
-    console.rule(style=C_PHASE)
-    console.print(f"  [{C_PHASE}]> DEEP SCAN — {target}[/]  "
-                  f"({len(known_ports)} port(s) from sweep — will re-verify)")
-    console.rule(style=C_PHASE)
-    console.print(f"  [{C_INFO}]Output:[/]  {os.path.abspath('.')}")
+    header = f"  [{C_PHASE}]{bt}> {target}[/]"
+    if tier:
+        header += f"   [{tier_c}]{tier}[/]  [{C_DIM}]{reason}[/]"
+    console.print(header)
+    console.print(f"    [{C_DIM}]{len(known_ports)} port(s) from sweep · re-verifying · {os.path.abspath('.')}[/]")
 
     logfile = open("00.tcp_chain.log", "a")
 
-    def tcp_base(extra_flags: list) -> list:
+    def tcp_base(extra_flags):
         cmd = ["nmap"]
         if pivot:
             cmd.append("--unprivileged")
@@ -1451,109 +1682,137 @@ def _scan_single_host_from_sweep(target: str, known_ports: set, pivot: bool):
         cmd.extend(extra_flags)
         return cmd
 
-    # ═══ UDP — Background ═══
+    # ═══ UDP — background ═══
     udp = None
     if not is_scan_complete("03.deep_udp_targeted.nmap"):
-        phase_header("UDP SCAN", f"Background — ports {UDP_PORTS}", C_INFO,
-                     pivot_note="through Ligolo-ng tunnel" if pivot else "")
         udp = start_udp_background(target, raw_dir_rel, pivot)
-        console.print(f"    [{C_OK}]+ UDP scan launched[/]  [{C_DIM}](PID {udp.pid})[/]")
-        if pivot:
-            console.print(f"    [{C_WARN}]  Note: UDP through Ligolo-ng tunnel may have limited reliability.[/]")
+        console.print(f"    [{C_DIM}]· UDP scan -> background (PID {udp.pid})[/]")
     else:
-        console.print(f"\n  [{C_OK}]+ UDP scan already exists — skipping.[/]")
+        console.print(f"    [{C_DIM}]· UDP already scanned — skipping.[/]")
 
-    # ═══ P1 — Careful deep scan of the DEFAULT top-1000 (independent of sweep) ═══
+    # ═══ P1 — careful deep scan of the DEFAULT top-1000 (independent of sweep) ═══
     p1_gnmap = os.path.join(raw_dir_rel, "01.deep_tcp_top1000.gnmap")
     if not is_scan_complete(p1_gnmap):
-        phase_header("P1 — DEEP TOP-1000 (independent)",
-                     "nmap -sC -sV -v --open  (nmap's own top-1000, not the sweep's)",
-                     pivot_note="+ --unprivileged -n" if pivot else "")
+        console.print(f"    [{C_DIM}]· P1 top-1000 (scripts + versions)...[/]")
         p1_cmd = _dedup_flags(tcp_base(["-sC", "-sV", "-v", "--open",
                                         "-oA", "01.deep_tcp_top1000", target]))
-        run_nmap_live(p1_cmd, "P1 top-1000", "01.deep_tcp_top1000", raw_dir_rel, logfile)
+        run_nmap_live(p1_cmd, "P1 top-1000", "01.deep_tcp_top1000", raw_dir_rel, logfile, terse=True)
     else:
-        console.print(f"\n  [{C_OK}]+ Top-1000 deep scan exists — skipping.[/]")
+        console.print(f"    [{C_OK}]· P1 top-1000 exists — skipping.[/]")
 
     p1_ports = extract_ports_from_gnmap(p1_gnmap)
     if p1_ports:
-        console.print(f"\n    [{C_PORT}]Top-1000 open ports:[/]  "
-                      f"{', '.join(str(p) for p in sorted(p1_ports))}")
-        console.print(f"\n    [{C_WARN}]->  You can start attacking now from another terminal![/]")
-        console.print(f"      [bold white]cat {os.path.abspath('01.deep_tcp_top1000.nmap')}[/]")
+        console.print(f"    [{C_OK}]v top-1000 open:[/] "
+                      f"[{C_PORT}]{', '.join(str(p) for p in sorted(p1_ports))}[/]")
+        console.print(f"      [{C_WARN}]attack now ->[/] "
+                      f"[bold white]cat {os.path.abspath('01.deep_tcp_top1000.nmap')}[/]")
 
-    # ═══ P2 — Authoritative full -p- re-sweep of THIS host ═══
-    # Default adaptive timing, no forced --min-rate: single-host full sweeps are
-    # fast, and dropping the aggressive rate is exactly what prevents missed ports.
+    # ═══ P2 — authoritative full -p- re-sweep of THIS host (no min-rate) ═══
     fresh_ports = set()
     if VERIFY_HOSTS_WITH_FULL_SWEEP:
-        time.sleep(2)
+        time.sleep(1)
         host_sweep_gnmap = os.path.join(raw_dir_rel, "05.host_full_tcp_sweep.gnmap")
         if not is_scan_complete(host_sweep_gnmap):
-            phase_header("P2 — FULL PORT RE-SWEEP (this host)",
-                         "nmap -Pn -n -p- -v --open  (default timing, no min-rate → reliable)",
-                         pivot_note="+ --unprivileged" if pivot else "")
+            console.print(f"    [{C_DIM}]· P2 full -p- re-sweep (no min-rate -> reliable)...[/]")
             b_cmd = _dedup_flags(tcp_base(["-n", "-p-", "-v", "--open",
                                            "-oA", "05.host_full_tcp_sweep", target]))
-            run_nmap_live(b_cmd, "Full re-sweep", "05.host_full_tcp_sweep", raw_dir_rel, logfile)
+            run_nmap_live(b_cmd, "Full re-sweep", "05.host_full_tcp_sweep", raw_dir_rel, logfile, terse=True)
         else:
-            console.print(f"\n  [{C_OK}]+ Full port re-sweep exists — skipping.[/]")
+            console.print(f"    [{C_OK}]· Full re-sweep exists — skipping.[/]")
         fresh_ports = extract_ports_from_gnmap(host_sweep_gnmap)
 
-    # Union of what the aggregate sweep saw and what this host's own sweep saw —
-    # nothing found by either pass is ever dropped.
     all_open = set(known_ports) | fresh_ports
     beyond_top1000 = sorted(all_open - TOP_1000)
 
-    missed_by_aggregate = sorted(fresh_ports - set(known_ports))
-    if missed_by_aggregate:
-        console.print(f"\n    [{C_WARN}]! Re-sweep found {len(missed_by_aggregate)} port(s) "
-                      f"the network sweep missed:[/]  "
-                      f"[{C_PORT}]{', '.join(str(p) for p in missed_by_aggregate)}[/]")
+    missed = sorted(fresh_ports - set(known_ports))
+    if missed:
+        console.print(f"    [{C_WARN}]! re-sweep caught {len(missed)} port(s) the network sweep missed:[/] "
+                      f"[{C_PORT}]{', '.join(str(p) for p in missed)}[/]")
 
-    # ═══ P3 — Careful scan of ports beyond the top-1000 ═══
-    time.sleep(2)
+    # ═══ P3 — careful scan of ports beyond the top-1000 ═══
+    time.sleep(1)
     p4_gnmap = os.path.join(raw_dir_rel, "04.deep_tcp_targeted.gnmap")
     if not is_scan_complete(p4_gnmap):
         if beyond_top1000:
             port_str = ",".join(str(p) for p in beyond_top1000)
-            phase_header("P3 — DEEP SCAN (ports beyond top-1000)",
-                         f"{len(beyond_top1000)} port(s) outside top-1000: {port_str}",
-                         pivot_note="+ --unprivileged -n" if pivot else "")
+            console.print(f"    [{C_DIM}]· P3 deep scan on {len(beyond_top1000)} port(s) beyond top-1000: {port_str}[/]")
             p3_cmd = _dedup_flags(tcp_base(["-sC", "-sV", "-v", "--open",
                                             "-p", port_str,
                                             "-oA", "04.deep_tcp_targeted", target]))
-            run_nmap_live(p3_cmd, "Deep beyond-top-1000", "04.deep_tcp_targeted", raw_dir_rel, logfile)
+            run_nmap_live(p3_cmd, "Deep beyond-top-1000", "04.deep_tcp_targeted", raw_dir_rel, logfile, terse=True)
         else:
-            console.print(f"\n  [{C_DIM}]No open ports beyond the top-1000 — skipping P3.[/]")
+            console.print(f"    [{C_DIM}]· No ports beyond top-1000 — P3 skipped.[/]")
     else:
-        console.print(f"\n  [{C_OK}]+ Beyond-top-1000 deep scan exists — skipping.[/]")
+        console.print(f"    [{C_OK}]· P3 exists — skipping.[/]")
 
     logfile.close()
 
-    # ── Wait for UDP ──
+    # ── Wait for UDP, then terse summary ──
     udp_done = True
     if udp:
         udp_done = wait_for_udp(udp, raw_dir_rel)
-
     udp_gnmap = os.path.join(raw_dir_rel, "03.deep_udp_targeted.gnmap")
     if udp_done and os.path.exists(udp_gnmap):
-        print_udp_hints(udp_gnmap)
+        print_udp_summary_terse(udp_gnmap)
 
-    # ── Per-host summary ──
-    console.print()
-    console.rule(style=C_OK)
-    console.print(f"  [{C_OK}]+ Deep scan complete for {target}[/]")
-    console.print(f"    [{C_DIM}]Confirmed open TCP ports:[/]  {len(p1_ports | all_open)}")
-    console.print(f"    [{C_DIM}]Results in:[/]  {os.path.abspath('.')}")
-    console.rule(style=C_OK)
-
+    console.print(f"    [{C_OK}]v {target} done[/]  "
+                  f"[{C_DIM}]· {len(p1_ports | all_open)} TCP port(s) confirmed · {os.path.abspath('.')}[/]")
     os.chdir(saved_cwd)
 
 
-def _print_network_summary(cidr, base_dir, hosts_ports, completed, pivot):
+def print_udp_summary_terse(gnmap_path: str):
+    """One-line UDP result for autoscan (full TIPS block is for single-target mode)."""
+    ports = extract_ports_from_gnmap(gnmap_path)
+    if not ports:
+        console.print(f"    [{C_DIM}]· UDP: no open ports.[/]")
+        return
+    labels = []
+    for p in sorted(ports):
+        svc = UDP_HINTS[p][0] if p in UDP_HINTS else "?"
+        labels.append(f"{p}/{svc}")
+    console.print(f"    [{C_HINT}]· UDP open:[/] [{C_PORT}]{', '.join(labels)}[/] "
+                  f"[{C_DIM}]-> cat {os.path.abspath('03.deep_udp_targeted.nmap')}[/]")
+
+
+def _save_target_list(cidr, order, excluded, priorities, hosts_ports, completed) -> str:
+    """Write the (possibly reordered) prioritized target list to a text file.
+    Saved in the range directory. Returns the filename."""
+    fname = "targets_priority.txt"
+    L = []
+    L.append(f"# Recon target list — {cidr}")
+    L.append("# Auto-prioritized by Recon.py (CTF/pentest heuristics).")
+    L.append("# Top = highest priority = scan first. Order reflects any manual reordering.")
+    L.append("#")
+    L.append(f"#  {'#':>2}  {'PRI':<4}  {'HOST':<15}  {'PORTS':>5}  {'STATUS':<9}  WHY")
+    for i, ip in enumerate(order, 1):
+        _score, tier, reason = priorities[ip]
+        pc = len(hosts_ports[ip])
+        if ip in completed:
+            status = "scanned"
+        elif ip in excluded:
+            status = "excluded"
+        else:
+            status = "pending"
+        L.append(f"   {i:>2}  {tier:<4}  {ip:<15}  {pc:>5}  {status:<9}  {reason}")
+    L.append("")
+    L.append("# Per-host open TCP ports (fast sweep — re-verified on deep scan):")
+    for ip in order:
+        ports = sorted(hosts_ports[ip])
+        plist = ",".join(str(p) for p in ports) if ports else "(none in sweep)"
+        L.append(f"{ip}: {plist}")
+    L.append("")
+    L.append("# Scan an individual host later:")
+    L.append("#   sudo python3 Recon.py  ->  Single Target  ->  <IP>")
+    with open(fname, "w") as f:
+        f.write("\n".join(L) + "\n")
+    return fname
+
+
+def _print_network_summary(cidr, base_dir, hosts_ports, completed, pivot, priorities=None):
     console.print()
     console.rule(style=C_OK)
+
+    tier_style = {"CRIT": "bold red", "HIGH": "bold yellow", "MED": "cyan", "LOW": "dim white"}
 
     table = Table(
         title=f"  Network Recon Summary — {cidr}" + ("  [PIVOT]" if pivot else ""),
@@ -1562,20 +1821,30 @@ def _print_network_summary(cidr, base_dir, hosts_ports, completed, pivot):
         title_style="bold green",
         padding=(0, 2),
     )
+    table.add_column("Pri", justify="center", min_width=4)
     table.add_column("Host", style="bold cyan", min_width=16)
     table.add_column("Open Ports", style="white", min_width=8)
     table.add_column("Status", style="white", min_width=12)
+    table.add_column("Why", style="dim white", min_width=18)
     table.add_column("Directory", style="dim white", min_width=20)
 
-    for ip in sorted(hosts_ports.keys(), key=lambda x: ipaddress.IPv4Address(x)):
+    def _row_key(ip):
+        if priorities:
+            return (_TIER_RANK[priorities[ip][1]], -priorities[ip][0], ipaddress.IPv4Address(ip))
+        return (0, 0, ipaddress.IPv4Address(ip))
+
+    for ip in sorted(hosts_ports.keys(), key=_row_key):
         port_count = len(hosts_ports[ip])
+        tier = priorities[ip][1] if priorities else "-"
+        reason = priorities[ip][2] if priorities else ""
+        pri_cell = f"[{tier_style.get(tier, 'white')}]{tier}[/]"
         if ip in completed:
             status = "[green]+ SCANNED[/]"
             directory = f"{base_dir}/{ip}/"
         else:
             status = "[yellow]- PENDING[/]"
             directory = "—"
-        table.add_row(ip, str(port_count), status, directory)
+        table.add_row(pri_cell, ip, str(port_count), status, reason, directory)
 
     console.print(table)
     console.print(f"\n  [{C_INFO}]Base directory:[/]  {base_dir}/")
