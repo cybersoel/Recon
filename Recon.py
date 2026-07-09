@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Recon.py v2.0 — Automated Nmap Recon Pipeline
+Recon.py v2.1 — Automated Nmap Recon Pipeline
 ──────────────────────────────────────────────
 Modes:
   1. Single Target           — standard scan against one host
@@ -9,7 +9,17 @@ Modes:
   4. Network Range (Pivot)   — discover + scan through Ligolo-ng tunnel
 
 Workflow:  UDP (background) → deep top-1000 → full sweep → new-port deep scan
-           (Network mode: discovery → sweep → interactive host selection → per-host deep scan)
+           (Network mode: fping+nmap discovery → sweep → interactive host
+            selection → per-host AUTHORITATIVE deep scan)
+
+Reliability model (v2.1):
+  * Discovery unions a fast fping (ICMP) pass with nmap's thorough pass, so a
+    host that only answers one of them is never silently dropped.
+  * Every discovered host is selectable — even ones the fast sweep reported
+    zero ports on.
+  * Each host you pick is re-scanned INDEPENDENTLY (careful top-1000 + a full
+    -p- re-sweep with no --min-rate), so a port the fast aggregate sweep drops
+    (the classic "3306 vanished" bug) is caught per host.
 
 Usage:  sudo python3 Recon.py
 """
@@ -55,6 +65,16 @@ UDP_HINTS = {
     1434: ("MS-SQL Browser", "nmap ms-sql-info, msfconsole mssql_ping, sqsh",
            "discover hidden SQL Server instances and their TCP ports — then pivot to TCP for the real attack"),
 }
+
+# ─── Reliability toggle ──────────────────────────────────────────────────────
+# When True, each host you pick for a deep scan gets its OWN full -p- re-sweep
+# (default adaptive timing, NO --min-rate) before the script/version scan, making
+# per-host results authoritative and independent of the fast aggregate sweep.
+# Costs one extra single-host full scan per SELECTED host (you only pay it for
+# hosts you care about). Set False to trust the aggregate sweep for ports beyond
+# the top-1000. Either way, the top-1000 is always deep-scanned independently, so
+# common ports (SSH/HTTP/MySQL-3306/RDP/...) can never be missed.
+VERIFY_HOSTS_WITH_FULL_SWEEP = True
 
 # Nmap default top-1000 TCP ports (for diff against full sweep)
 TOP_1000 = {
@@ -161,7 +181,7 @@ def _init_colors():
 BANNER_LINES = [
     r"  ╦═╗╔═╗╔═╗╔═╗╔╗╔",
     r"  ╠╦╝║╣ ║  ║ ║║║║",
-    r"  ╩╚═╚═╝╚═╝╚═╝╝╚╝  v2.0",
+    r"  ╩╚═╚═╝╚═╝╚═╝╝╚╝  v2.1",
     "",
     "  Automated Nmap Recon Pipeline",
     "  By Soel Kwun",
@@ -173,7 +193,7 @@ def curses_select_mode():
     modes = [
         ("Single Target",            "Standard scan against one host"),
         ("Single Target  [PIVOT]",   "Scan through active Ligolo-ng tunnel (--unprivileged, no min-rate)"),
-        ("Network Range",            "Discover hosts and scan a network range"),
+        ("Network Range",            "fping+nmap discovery, then scan a network range"),
         ("Network Range  [PIVOT]",   "Discover and scan through active Ligolo-ng tunnel"),
     ]
 
@@ -254,10 +274,10 @@ def curses_select_mode():
 def curses_select_minrate():
     """Min-rate selection. Returns int (0 = disabled)."""
     options = [
-        ("None  (disabled)",                0),
+        ("None  (disabled — most reliable, matches nmap defaults)", 0),
         ("500   (careful — production / client networks)", 500),
         ("2000  (standard — CTF exams: OSCP, CPTS)",      2000),
-        ("4000  (aggressive — HTB / fast labs)",           4000),
+        ("4000  (aggressive — HTB / fast labs ONLY; can drop ports)", 4000),
     ]
 
     def _run(stdscr):
@@ -280,7 +300,7 @@ def curses_select_minrate():
             y += 2
 
             for i, (label, _) in enumerate(options):
-                if y >= h - 2:
+                if y >= h - 4:
                     break
                 try:
                     if i == selected:
@@ -291,6 +311,16 @@ def curses_select_minrate():
                 except curses.error:
                     pass
                 y += 1
+
+            y += 1
+            try:
+                stdscr.addnstr(y, 2, "Higher = faster but likelier to drop a SYN/ACK and miss a port.",
+                               w - 3, curses.color_pair(6))
+                y += 1
+                stdscr.addnstr(y, 2, "In network mode, each host you pick is re-swept with no rate limit.",
+                               w - 3, curses.color_pair(6))
+            except curses.error:
+                pass
 
             y += 2
             try:
@@ -331,7 +361,7 @@ def curses_select_host(hosts_ports: dict, completed: set):
         Returns (line1, line2) where line2 may be empty."""
         s = sorted(ports)
         if not s:
-            return "", ""
+            return "(none in sweep — will re-verify)", ""
         line1 = ""
         cutoff = None
         for i, p in enumerate(s):
@@ -602,7 +632,10 @@ def curses_few_hosts_prompt(hosts: list, pivot: bool):
         return curses.wrapper(_run)
     except KeyboardInterrupt:
         sys.exit(130)
+
+
 udp_proc = None
+disc_proc = None
 
 
 def banner(pivot=False):
@@ -611,7 +644,7 @@ def banner(pivot=False):
     ╦═╗╔═╗╔═╗╔═╗╔╗╔
     ╠╦╝║╣ ║  ║ ║║║║
     ╩╚═╚═╝╚═╝╚═╝╝╚╝""", style="bold cyan")
-    art.append("  v2.0\n", style="dim cyan")
+    art.append("  v2.1\n", style="dim cyan")
     art.append("\n  Automated Nmap Recon Pipeline", style="bold white")
     if pivot:
         art.append("\n  MODE: ", style="dim white")
@@ -686,12 +719,16 @@ def extract_open_ports_from_verbose(line: str):
 
 
 def extract_ports_from_gnmap(gnmap_path: str) -> set:
-    """Extract all open port numbers from a .gnmap file."""
+    """Extract all open port numbers from a .gnmap file (TCP or UDP).
+    Also counts 'open|filtered' — for UDP that state is the norm and ignoring
+    it silently drops maybe-open services."""
     ports = set()
     try:
         with open(gnmap_path) as f:
             for line in f:
-                for m in re.finditer(r"(\d+)/open", line):
+                # Trailing '/' anchors to the STATE/PROTO field so we don't match
+                # a stray 'N/open' substring elsewhere.
+                for m in re.finditer(r"(\d+)/open(?:\|filtered)?/", line):
                     ports.add(int(m.group(1)))
     except FileNotFoundError:
         pass
@@ -699,19 +736,20 @@ def extract_ports_from_gnmap(gnmap_path: str) -> set:
 
 
 def extract_hosts_ports_from_gnmap(gnmap_path: str) -> dict:
-    """Parse gnmap to get {ip: set_of_open_tcp_ports} per host."""
+    """Parse gnmap to get {ip: set_of_open_tcp_ports} per host.
+    Includes 'open|filtered' TCP so a firewalled-but-live port isn't dropped."""
     hosts = {}
     try:
         with open(gnmap_path) as f:
             for line in f:
-                if "/open/" not in line:
+                if "/open" not in line:
                     continue
                 m = re.match(r"^Host:\s+(\S+)", line)
                 if not m:
                     continue
                 ip = m.group(1)
                 ports = set()
-                for pm in re.finditer(r"(\d+)/open/tcp", line):
+                for pm in re.finditer(r"(\d+)/open(?:\|filtered)?/tcp", line):
                     ports.add(int(pm.group(1)))
                 if ports:
                     hosts[ip] = ports
@@ -732,7 +770,7 @@ def extract_live_hosts_from_gnmap(gnmap_path: str) -> list:
                         hosts.append(m.group(1))
     except FileNotFoundError:
         pass
-    return sorted(hosts, key=lambda x: ipaddress.IPv4Address(x))
+    return sorted(set(hosts), key=lambda x: ipaddress.IPv4Address(x))
 
 
 def is_scan_complete(filepath: str) -> bool:
@@ -882,6 +920,165 @@ def wait_for_udp(udp: subprocess.Popen, raw_dir: str) -> bool:
             console.print(f"    [{C_WARN}]Skipping UDP wait.[/]")
     move_udp_outputs(raw_dir)
     return udp_done
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  HOST DISCOVERY  (fping fast pass  +  nmap thorough pass, unioned)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_fping_discovery(cidr: str, pivot: bool = False):
+    """
+    Fast ICMP host discovery with fping (parallel — a whole /24 in ~seconds).
+
+    Returns (alive_ips: list, status: str)
+      status == "ok"     -> fping ran, alive_ips is the result (possibly empty)
+      status == "absent" -> fping not installed
+      status == "error"  -> fping failed to run
+
+    In pivot mode ICMP is sent through the Ligolo-ng TUN. This often works even
+    though the tool historically assumed ICMP was blocked — so fping is tried
+    first and UNIONED with the TCP-SYN discovery, meaning nothing is silently
+    missed either way.
+    """
+    if not shutil.which("fping"):
+        return [], "absent"
+
+    # fping pings all targets in parallel, so total time ≈ timeout × (retries+1),
+    # roughly independent of how many hosts are down.
+    #   -a alive only   -q quiet (suppress per-target stats/errors)
+    #   -g generate from CIDR   -r retries   -t per-probe timeout (ms)
+    if pivot:
+        cmd = ["fping", "-a", "-q", "-r", "2", "-t", "1200", "-g", cidr]  # tolerate tunnel latency
+    else:
+        cmd = ["fping", "-a", "-q", "-r", "2", "-t", "500", "-g", cidr]
+
+    full = (["sudo"] + cmd) if os.geteuid() != 0 else cmd
+    try:
+        result = subprocess.run(full, capture_output=True, text=True, timeout=180)
+    except (subprocess.TimeoutExpired, Exception):
+        return [], "error"
+
+    alive = []
+    for ln in result.stdout.splitlines():
+        ip = ln.strip()
+        if ip and validate_ip(ip):
+            alive.append(ip)
+    return sorted(set(alive), key=lambda x: ipaddress.IPv4Address(x)), "ok"
+
+
+def _launch_nmap_discovery_bg(cidr: str, raw_dir_rel: str, pivot: bool):
+    """
+    Launch nmap host discovery in the BACKGROUND so the fast fping pass can run
+    (and display) in the foreground first. Returns the Popen (or None on failure).
+
+    Normal: -sn  (ICMP echo + timestamp + TCP SYN/ACK — catches ICMP-filtered hosts)
+    Pivot : --unprivileged -sn -PS<ports>  (TCP-SYN discovery — no ICMP assumed)
+    """
+    global disc_proc
+    live_path = os.path.join(raw_dir_rel, "01.discovery.live")
+    if pivot:
+        cmd = ["nmap", "--unprivileged", "-sn", "-n", "-v",
+               f"-PS{PIVOT_DISCOVERY_PORTS}", "-oA", "01.discovery", cidr]
+    else:
+        cmd = ["nmap", "-sn", "-v", "-oA", "01.discovery", cidr]
+
+    full = (["sudo"] + cmd) if os.geteuid() != 0 else cmd
+    try:
+        fh = open(live_path, "w")
+        disc_proc = subprocess.Popen(full, stdout=fh, stderr=subprocess.STDOUT)
+        return disc_proc
+    except Exception:
+        return None
+
+
+def _discover_hosts(cidr: str, raw_dir_rel: str, pivot: bool) -> list:
+    """
+    Layered host discovery:
+      * fast fping ICMP preview (foreground)  — you see live hosts in seconds
+      * thorough nmap pass (background)       — catches hosts fping can't see
+    then UNION so no live host is silently missed. Returns a sorted list of IPs,
+    writes 02.live_hosts.txt, and moves nmap outputs into raw/.
+    """
+    global disc_proc
+    live_hosts_file = "02.live_hosts.txt"
+
+    if pivot:
+        phase_header("PHASE 1 — HOST DISCOVERY",
+                     f"fping ICMP (fast)  +  nmap -PS{PIVOT_DISCOVERY_PORTS} (thorough)",
+                     C_PIVOT, pivot_note="ICMP tried through tunnel + TCP-SYN, results unioned")
+    else:
+        phase_header("PHASE 1 — HOST DISCOVERY",
+                     "fping ICMP (fast preview)  +  nmap -sn (thorough, catches filtered hosts)")
+
+    # Kick off the thorough nmap pass in the background right away.
+    nmap_bg = _launch_nmap_discovery_bg(cidr, raw_dir_rel, pivot)
+    if nmap_bg:
+        console.print(f"    [{C_DIM}]nmap thorough discovery running in background (PID {nmap_bg.pid})...[/]")
+
+    # Fast fping preview in the foreground.
+    fping_hosts, fp_status = run_fping_discovery(cidr, pivot)
+    if fp_status == "absent":
+        console.print(f"    [{C_WARN}]fping not installed — using nmap discovery only.[/]")
+        console.print(f"    [{C_DIM}]  Install for ~3-second sweeps:  sudo apt install fping[/]")
+    elif fp_status == "error":
+        console.print(f"    [{C_WARN}]fping ran into an error — relying on nmap discovery.[/]")
+    else:
+        if fping_hosts:
+            console.print(f"\n    [{C_OK}]+ fping found {len(fping_hosts)} host(s) instantly:[/]")
+            for ip in fping_hosts:
+                console.print(f"      [{C_PORT}]{ip}[/]  [{C_DIM}](ICMP)[/]")
+        else:
+            why = "ICMP may be filtered through the tunnel" if pivot else "hosts may be blocking ping"
+            console.print(f"    [{C_DIM}]fping saw no ICMP-responsive hosts ({why}).[/]")
+
+    # Wait for the thorough nmap pass to finish (it's the reliability backstop).
+    nmap_hosts = []
+    if nmap_bg:
+        if nmap_bg.poll() is None:
+            console.print(f"\n    [{C_INFO}]Waiting for nmap thorough pass "
+                          f"(catches hosts fping can't see)...[/]  [{C_DIM}](Ctrl+C to skip)[/]")
+        try:
+            nmap_bg.wait(timeout=600)
+        except subprocess.TimeoutExpired:
+            console.print(f"    [{C_WARN}]nmap discovery slow (>10 min) — proceeding with what we have.[/]")
+            try:
+                nmap_bg.terminate()
+            except Exception:
+                pass
+        except KeyboardInterrupt:
+            console.print(f"    [{C_WARN}]Skipping nmap discovery wait — using fping results only.[/]")
+            try:
+                nmap_bg.terminate()
+            except Exception:
+                pass
+        disc_proc = None
+        # Move nmap outputs into raw/ (its .nmap stays at top level, like the sweeps).
+        for ext in [".gnmap", ".xml"]:
+            src = f"01.discovery{ext}"
+            if os.path.exists(src):
+                shutil.move(src, os.path.join(raw_dir_rel, os.path.basename(src)))
+        nmap_hosts = extract_live_hosts_from_gnmap(os.path.join(raw_dir_rel, "01.discovery.gnmap"))
+
+    # UNION — reliability: never drop a host that either method found.
+    all_set = set(fping_hosts) | set(nmap_hosts)
+    all_hosts = sorted(all_set, key=lambda x: ipaddress.IPv4Address(x))
+
+    # Report the delta so coverage is trustworthy and visible.
+    only_nmap = sorted(set(nmap_hosts) - set(fping_hosts), key=lambda x: ipaddress.IPv4Address(x))
+    only_fping = sorted(set(fping_hosts) - set(nmap_hosts), key=lambda x: ipaddress.IPv4Address(x))
+    if only_nmap:
+        tag = "TCP-SYN caught, ICMP missed" if pivot else "likely ICMP-filtered"
+        console.print(f"\n    [{C_WARN}]! nmap caught {len(only_nmap)} host(s) fping missed "
+                      f"({tag}):[/]  [{C_PORT}]{', '.join(only_nmap)}[/]")
+    if only_fping and nmap_bg:
+        tag = "ICMP answered, probe ports closed"
+        console.print(f"    [{C_DIM}]  fping-only host(s) ({tag}): {', '.join(only_fping)}[/]")
+
+    if all_hosts:
+        with open(live_hosts_file, "w") as f:
+            f.write("\n".join(all_hosts) + "\n")
+
+    return all_hosts
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1083,9 +1280,9 @@ def pipeline_network(cidr: str, minrate: int, pivot: bool):
 
     console.print(f"  [{C_INFO}]Output directory:[/]  {os.path.abspath('.')}")
     if pivot:
-        console.print(f"  [{C_PIVOT}]   PIVOT MODE: TCP-based discovery | --unprivileged | no min-rate[/]")
+        console.print(f"  [{C_PIVOT}]   PIVOT MODE: fping ICMP + TCP-SYN discovery | --unprivileged | no min-rate[/]")
 
-    # ── Pivot-aware nmap flag builder ──
+    # ── Pivot-aware nmap flag builder (for the sweep) ──
     def tcp_base(extra_flags: list) -> list:
         cmd = ["nmap"]
         if pivot:
@@ -1094,48 +1291,27 @@ def pipeline_network(cidr: str, minrate: int, pivot: bool):
         cmd.extend(extra_flags)
         return cmd
 
-    # ═══ PHASE 1 — Host Discovery ═══
+    # ═══ PHASE 1 — Host Discovery (fping fast + nmap thorough, unioned) ═══
     discovery_gnmap = os.path.join(raw_dir_rel, "01.discovery.gnmap")
     live_hosts_file = "02.live_hosts.txt"
 
-    if is_scan_complete(discovery_gnmap) and os.path.exists(live_hosts_file) and os.path.getsize(live_hosts_file) > 0:
+    if (os.path.exists(live_hosts_file) and os.path.getsize(live_hosts_file) > 0
+            and is_scan_complete(discovery_gnmap)):
         console.print(f"\n  [{C_OK}]+ Discovery results exist — skipping.[/]")
         with open(live_hosts_file) as f:
             live_hosts = [line.strip() for line in f if line.strip()]
     else:
+        live_hosts = _discover_hosts(cidr, raw_dir_rel, pivot)
+
+    if not live_hosts:
+        console.print(f"\n  [{C_ERR}]x No live hosts found in {cidr}.[/]")
         if pivot:
-            phase_header("PHASE 1 — HOST DISCOVERY (TCP PROBE)",
-                         f"nmap --unprivileged -sn -PS{PIVOT_DISCOVERY_PORTS}  (no ICMP through tunnel)",
-                         C_PIVOT)
-            disc_cmd = ["nmap", "--unprivileged", "-sn", "-n", "-v",
-                        f"-PS{PIVOT_DISCOVERY_PORTS}",
-                        "-oA", "01.discovery",
-                        cidr]
-        else:
-            phase_header("PHASE 1 — HOST DISCOVERY",
-                         "nmap -sn -v  (ICMP + TCP probe)")
-            disc_cmd = ["nmap", "-sn", "-v",
-                        "-oA", "01.discovery",
-                        cidr]
+            console.print(f"    [{C_WARN}]Tip: Verify Ligolo-ng tunnel is active and routes are set.[/]")
+        console.print(f"    [{C_DIM}]If you know a host is up, try Single Target mode (it uses -Pn).[/]")
+        os.chdir(start_cwd)
+        return
 
-        disc_rc = run_nmap_live(disc_cmd, "Discovery", "01.discovery", raw_dir_rel, show_ports=False)
-
-        # Extract live hosts
-        gnmap_path = os.path.join(raw_dir_rel, "01.discovery.gnmap")
-        live_hosts = extract_live_hosts_from_gnmap(gnmap_path)
-
-        if not live_hosts:
-            console.print(f"\n  [{C_ERR}]x No live hosts found in {cidr}.[/]")
-            if pivot:
-                console.print(f"    [{C_WARN}]Tip: Verify Ligolo-ng tunnel is active and routes are set.[/]")
-            os.chdir(start_cwd)
-            return
-
-        # Write live hosts file
-        with open(live_hosts_file, "w") as f:
-            f.write("\n".join(live_hosts) + "\n")
-
-    console.print(f"\n    [{C_OK}]+ {len(live_hosts)} live host(s) found:[/]")
+    console.print(f"\n    [{C_OK}]+ {len(live_hosts)} live host(s) total:[/]")
     for ip in live_hosts:
         console.print(f"      [{C_PORT}]{ip}[/]")
 
@@ -1166,6 +1342,8 @@ def pipeline_network(cidr: str, minrate: int, pivot: bool):
         phase_header("PHASE 2 — FULL PORT SWEEP (ALL HOSTS)",
                      f"nmap -Pn -n -p- -v --open -iL live_hosts  ({rate_desc})",
                      pivot_note="+ --unprivileged" if pivot else "")
+        console.print(f"  [{C_DIM}]  This is a fast PREVIEW to prioritize hosts; each host you pick is "
+                      f"re-verified independently.[/]\n")
 
         sweep_flags = ["-n", "-p-", "-v", "--open"]
         if minrate > 0:
@@ -1182,16 +1360,20 @@ def pipeline_network(cidr: str, minrate: int, pivot: bool):
             os.chdir(start_cwd)
             return
 
-    # ── Parse sweep results ──
-    hosts_ports = extract_hosts_ports_from_gnmap(sweep_gnmap)
+    # ── Parse sweep results (fast PREVIEW only — used to prioritize hosts) ──
+    sweep_hosts_ports = extract_hosts_ports_from_gnmap(sweep_gnmap)
 
-    if not hosts_ports:
-        console.print(f"\n  [{C_WARN}]No open TCP ports found across all hosts.[/]")
-        os.chdir(start_cwd)
-        return
+    # Make EVERY discovered host selectable, even ones the fast aggregate sweep
+    # reported no open ports on. Each host you pick is re-verified independently
+    # in the deep-scan phase, so a host the sweep under-reported (or a port it
+    # dropped) can still be caught.
+    hosts_ports = {ip: sweep_hosts_ports.get(ip, set()) for ip in live_hosts}
 
     total_ports = sum(len(p) for p in hosts_ports.values())
-    console.print(f"\n    [{C_OK}]+ Sweep complete:[/]  {len(hosts_ports)} host(s) with {total_ports} total open TCP port(s)")
+    hosts_with_ports = sum(1 for p in hosts_ports.values() if p)
+    console.print(f"\n    [{C_OK}]+ Sweep complete:[/]  {hosts_with_ports} host(s) reported open ports "
+                  f"({total_ports} total); all {len(hosts_ports)} live host(s) selectable")
+    console.print(f"    [{C_DIM}]  Each deep scan re-verifies its host, so sweep misses don't propagate.[/]")
 
     # ═══ PHASE 3 — Interactive Per-Host Deep Scan Loop ═══
     completed_hosts = _detect_completed_hosts(hosts_ports)
@@ -1235,8 +1417,14 @@ def _detect_completed_hosts(hosts_ports: dict) -> set:
 
 def _scan_single_host_from_sweep(target: str, known_ports: set, pivot: bool):
     """
-    Deep scan a single host whose open ports are already known from the network sweep.
-    Creates a per-host subdirectory and runs targeted deep scans + UDP.
+    Deep scan a single host — AUTHORITATIVE and independent of the aggregate
+    network sweep, so a miss in the fast all-hosts sweep can't reach the result.
+
+      P1: careful -sC -sV on nmap's DEFAULT top-1000  (guarantees common ports)
+      P2: full -p- re-sweep of THIS host, default adaptive timing, NO --min-rate
+          (aggressive rates are what drop SYN/ACKs and cause missed ports)
+      P3: careful -sC -sV on any ports beyond the top-1000
+          (union of aggregate-sweep hits and this host's fresh -p- results)
     """
     host_dir = target
     raw_dir = os.path.join(host_dir, "raw")
@@ -1248,7 +1436,8 @@ def _scan_single_host_from_sweep(target: str, known_ports: set, pivot: bool):
 
     console.print()
     console.rule(style=C_PHASE)
-    console.print(f"  [{C_PHASE}]> DEEP SCAN — {target}[/]  ({len(known_ports)} known open port(s))")
+    console.print(f"  [{C_PHASE}]> DEEP SCAN — {target}[/]  "
+                  f"({len(known_ports)} port(s) from sweep — will re-verify)")
     console.rule(style=C_PHASE)
     console.print(f"  [{C_INFO}]Output:[/]  {os.path.abspath('.')}")
 
@@ -1262,10 +1451,6 @@ def _scan_single_host_from_sweep(target: str, known_ports: set, pivot: bool):
         cmd.extend(extra_flags)
         return cmd
 
-    # Split known ports into top-1000 and non-top-1000
-    top1000_open   = sorted(known_ports & TOP_1000)
-    non_top1000    = sorted(known_ports - TOP_1000)
-
     # ═══ UDP — Background ═══
     udp = None
     if not is_scan_complete("03.deep_udp_targeted.nmap"):
@@ -1278,48 +1463,71 @@ def _scan_single_host_from_sweep(target: str, known_ports: set, pivot: bool):
     else:
         console.print(f"\n  [{C_OK}]+ UDP scan already exists — skipping.[/]")
 
-    # ═══ Deep scan — Top-1000 ports (only those confirmed open) ═══
+    # ═══ P1 — Careful deep scan of the DEFAULT top-1000 (independent of sweep) ═══
     p1_gnmap = os.path.join(raw_dir_rel, "01.deep_tcp_top1000.gnmap")
-    p1_rc = 0
     if not is_scan_complete(p1_gnmap):
-        if top1000_open:
-            port_str = ",".join(str(p) for p in top1000_open)
-            phase_header("DEEP SCAN — TOP-1000 PORTS",
-                         f"{len(top1000_open)} known open port(s): {port_str}",
-                         pivot_note="+ --unprivileged -n" if pivot else "")
-            p1_cmd = tcp_base(["-sC", "-sV", "-v", "--open",
-                               "-p", port_str,
-                               "-oA", "01.deep_tcp_top1000", target])
-            p1_cmd = _dedup_flags(p1_cmd)
-            p1_rc = run_nmap_live(p1_cmd, "Deep top-1000", "01.deep_tcp_top1000", raw_dir_rel, logfile)
-        else:
-            console.print(f"\n  [{C_DIM}]No open ports in the top-1000 set — skipping P1.[/]")
+        phase_header("P1 — DEEP TOP-1000 (independent)",
+                     "nmap -sC -sV -v --open  (nmap's own top-1000, not the sweep's)",
+                     pivot_note="+ --unprivileged -n" if pivot else "")
+        p1_cmd = _dedup_flags(tcp_base(["-sC", "-sV", "-v", "--open",
+                                        "-oA", "01.deep_tcp_top1000", target]))
+        run_nmap_live(p1_cmd, "P1 top-1000", "01.deep_tcp_top1000", raw_dir_rel, logfile)
     else:
         console.print(f"\n  [{C_OK}]+ Top-1000 deep scan exists — skipping.[/]")
 
     p1_ports = extract_ports_from_gnmap(p1_gnmap)
     if p1_ports:
+        console.print(f"\n    [{C_PORT}]Top-1000 open ports:[/]  "
+                      f"{', '.join(str(p) for p in sorted(p1_ports))}")
         console.print(f"\n    [{C_WARN}]->  You can start attacking now from another terminal![/]")
         console.print(f"      [bold white]cat {os.path.abspath('01.deep_tcp_top1000.nmap')}[/]")
 
-    # ═══ Deep scan — Non-top-1000 ports ═══
+    # ═══ P2 — Authoritative full -p- re-sweep of THIS host ═══
+    # Default adaptive timing, no forced --min-rate: single-host full sweeps are
+    # fast, and dropping the aggressive rate is exactly what prevents missed ports.
+    fresh_ports = set()
+    if VERIFY_HOSTS_WITH_FULL_SWEEP:
+        time.sleep(2)
+        host_sweep_gnmap = os.path.join(raw_dir_rel, "05.host_full_tcp_sweep.gnmap")
+        if not is_scan_complete(host_sweep_gnmap):
+            phase_header("P2 — FULL PORT RE-SWEEP (this host)",
+                         "nmap -Pn -n -p- -v --open  (default timing, no min-rate → reliable)",
+                         pivot_note="+ --unprivileged" if pivot else "")
+            b_cmd = _dedup_flags(tcp_base(["-n", "-p-", "-v", "--open",
+                                           "-oA", "05.host_full_tcp_sweep", target]))
+            run_nmap_live(b_cmd, "Full re-sweep", "05.host_full_tcp_sweep", raw_dir_rel, logfile)
+        else:
+            console.print(f"\n  [{C_OK}]+ Full port re-sweep exists — skipping.[/]")
+        fresh_ports = extract_ports_from_gnmap(host_sweep_gnmap)
+
+    # Union of what the aggregate sweep saw and what this host's own sweep saw —
+    # nothing found by either pass is ever dropped.
+    all_open = set(known_ports) | fresh_ports
+    beyond_top1000 = sorted(all_open - TOP_1000)
+
+    missed_by_aggregate = sorted(fresh_ports - set(known_ports))
+    if missed_by_aggregate:
+        console.print(f"\n    [{C_WARN}]! Re-sweep found {len(missed_by_aggregate)} port(s) "
+                      f"the network sweep missed:[/]  "
+                      f"[{C_PORT}]{', '.join(str(p) for p in missed_by_aggregate)}[/]")
+
+    # ═══ P3 — Careful scan of ports beyond the top-1000 ═══
     time.sleep(2)
     p4_gnmap = os.path.join(raw_dir_rel, "04.deep_tcp_targeted.gnmap")
     if not is_scan_complete(p4_gnmap):
-        if non_top1000:
-            port_str = ",".join(str(p) for p in non_top1000)
-            phase_header("DEEP SCAN — NON-TOP-1000 PORTS",
-                         f"{len(non_top1000)} port(s) outside top-1000: {port_str}",
+        if beyond_top1000:
+            port_str = ",".join(str(p) for p in beyond_top1000)
+            phase_header("P3 — DEEP SCAN (ports beyond top-1000)",
+                         f"{len(beyond_top1000)} port(s) outside top-1000: {port_str}",
                          pivot_note="+ --unprivileged -n" if pivot else "")
-            p3_cmd = tcp_base(["-sC", "-sV", "-v", "--open",
-                               "-p", port_str,
-                               "-oA", "04.deep_tcp_targeted", target])
-            p3_cmd = _dedup_flags(p3_cmd)
-            run_nmap_live(p3_cmd, "Deep non-top-1000", "04.deep_tcp_targeted", raw_dir_rel, logfile)
+            p3_cmd = _dedup_flags(tcp_base(["-sC", "-sV", "-v", "--open",
+                                            "-p", port_str,
+                                            "-oA", "04.deep_tcp_targeted", target]))
+            run_nmap_live(p3_cmd, "Deep beyond-top-1000", "04.deep_tcp_targeted", raw_dir_rel, logfile)
         else:
-            console.print(f"\n  [{C_DIM}]No open ports outside the top-1000 set — skipping P3.[/]")
+            console.print(f"\n  [{C_DIM}]No open ports beyond the top-1000 — skipping P3.[/]")
     else:
-        console.print(f"\n  [{C_OK}]+ Non-top-1000 deep scan exists — skipping.[/]")
+        console.print(f"\n  [{C_OK}]+ Beyond-top-1000 deep scan exists — skipping.[/]")
 
     logfile.close()
 
@@ -1336,6 +1544,7 @@ def _scan_single_host_from_sweep(target: str, known_ports: set, pivot: bool):
     console.print()
     console.rule(style=C_OK)
     console.print(f"  [{C_OK}]+ Deep scan complete for {target}[/]")
+    console.print(f"    [{C_DIM}]Confirmed open TCP ports:[/]  {len(p1_ports | all_open)}")
     console.print(f"    [{C_DIM}]Results in:[/]  {os.path.abspath('.')}")
     console.rule(style=C_OK)
 
@@ -1372,6 +1581,7 @@ def _print_network_summary(cidr, base_dir, hosts_ports, completed, pivot):
     console.print(f"\n  [{C_INFO}]Base directory:[/]  {base_dir}/")
     console.print(f"    [{C_DIM}]Discovery / sweep results at top level.[/]")
     console.print(f"    [{C_DIM}]Per-host deep scan results in each host directory.[/]")
+    console.print(f"    [{C_DIM}]Port counts above are from the fast sweep; scanned hosts were re-verified.[/]")
     console.rule(style=C_OK)
     console.print()
 
@@ -1407,11 +1617,15 @@ def _dedup_flags(cmd: list) -> list:
 
 
 def cleanup(signum=None, frame=None):
-    global udp_proc
+    global udp_proc, disc_proc
     console.print(f"\n\n  [{C_WARN}]Interrupted — cleaning up...[/]")
-    if udp_proc and udp_proc.poll() is None:
-        udp_proc.terminate()
-        console.print(f"    [{C_DIM}]UDP scan terminated.[/]")
+    for proc, label in ((udp_proc, "UDP scan"), (disc_proc, "discovery scan")):
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                console.print(f"    [{C_DIM}]{label} terminated.[/]")
+            except Exception:
+                pass
     console.print(f"    [{C_DIM}]Partial results saved in the target directory.[/]\n")
     sys.exit(130)
 
@@ -1437,7 +1651,7 @@ def main():
 
     # ── Root check ──
     if os.geteuid() != 0:
-        console.print(f"  [{C_WARN}]Not running as root. UDP and SYN scans require sudo.[/]")
+        console.print(f"  [{C_WARN}]Not running as root. UDP, SYN, and fping ICMP scans require sudo.[/]")
         console.print(f"    [{C_DIM}]Re-run with:  sudo python3 Recon.py[/]\n")
         sys.exit(1)
 
@@ -1448,6 +1662,7 @@ def main():
         minrate = 0 if pivot else curses_select_minrate()
         if not pivot and minrate > 0:
             console.print(f"  [{C_INFO}]  --min-rate:[/]  {minrate}")
+        _minrate_caution(minrate, network=True)
         console.print()
         pipeline_network(cidr, minrate, pivot)
     else:
@@ -1456,8 +1671,22 @@ def main():
         minrate = 0 if pivot else curses_select_minrate()
         if not pivot and minrate > 0:
             console.print(f"  [{C_INFO}]  --min-rate:[/]  {minrate}")
+        _minrate_caution(minrate, network=False)
         console.print()
         pipeline_single(target, minrate, pivot)
+
+
+def _minrate_caution(minrate: int, network: bool):
+    """Warn when an aggressive min-rate is chosen; note the reliability backstop."""
+    if minrate >= 4000:
+        console.print(f"  [{C_WARN}]  Caution:[/] --min-rate {minrate} is aggressive; on congested or "
+                      f"filtered networks it can silently drop ports.")
+        if network:
+            console.print(f"  [{C_DIM}]           Each host you deep-scan is re-swept with no rate limit, "
+                          f"so misses are caught there.[/]")
+        else:
+            console.print(f"  [{C_DIM}]           If results look thin, re-run — the careful top-1000 scan "
+                          f"still covers common ports.[/]")
 
 
 if __name__ == "__main__":
