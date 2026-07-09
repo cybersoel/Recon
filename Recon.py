@@ -24,8 +24,24 @@ Reliability model (v2.1):
 Usage:  sudo python3 Recon.py
 """
 
-import subprocess, sys, os, re, signal, time, shutil, ipaddress, curses
+import subprocess, sys, os, re, signal, time, shutil, ipaddress, curses, locale
 from pathlib import Path
+
+# Use the terminal's encoding so box-drawing / block glyphs render in curses.
+try:
+    locale.setlocale(locale.LC_ALL, "")
+except locale.Error:
+    pass
+
+# Prefer pretty glyphs on UTF-8 terminals; fall back to ASCII elsewhere so the
+# curses UI can never crash on an un-encodable character.
+_UTF8 = "utf" in (locale.getpreferredencoding(False) or "").lower()
+_HLINE    = "─" if _UTF8 else "-"
+_ARROW_UD = "↑/↓" if _UTF8 else "Up/Dn"
+_SHIFT_UD = "Shift+↑/↓" if _UTF8 else "Shift+Up/Dn"
+_CHECK    = "✓" if _UTF8 else "*"
+_ELL      = "…" if _UTF8 else ".."
+_DOT      = " · " if _UTF8 else " | "
 
 try:
     from rich.console import Console
@@ -261,7 +277,7 @@ def _score_host(ports: set):
         tier = "MED" if len(p) >= 3 else "LOW"
 
     if not roles:
-        roles.append(f"{len(p)} misc port(s)" if p else "none in sweep — re-verify")
+        roles.append(f"{len(p)} misc port(s)" if p else "none in sweep - re-verify")
     reason = " + ".join(roles[:3])
     return score, tier, reason
 
@@ -286,15 +302,27 @@ def _init_colors():
     """Initialize curses color pairs."""
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_CYAN, -1)     # selected / accent
+    curses.init_pair(1, curses.COLOR_CYAN, -1)     # selected / accent / IP
     curses.init_pair(2, curses.COLOR_WHITE, -1)     # normal text
     curses.init_pair(3, curses.COLOR_GREEN, -1)     # completed / success
-    curses.init_pair(4, curses.COLOR_YELLOW, -1)    # warning
-    curses.init_pair(5, curses.COLOR_RED, -1)       # pivot accent
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)    # warning / HIGH
+    curses.init_pair(5, curses.COLOR_RED, -1)       # pivot accent / CRIT
     try:
         curses.init_pair(6, 8, -1)                  # dim gray (if supported)
     except curses.error:
         curses.init_pair(6, curses.COLOR_WHITE, -1)
+    # Extended palette for the target cockpit (guarded — most terms have >=64 pairs)
+    try:
+        curses.init_pair(7, curses.COLOR_BLUE, -1)                       # LOW / muted
+        curses.init_pair(8, curses.COLOR_MAGENTA, -1)                    # misc accent
+        # Selection bars, tinted by priority tier (bg = tier color):
+        curses.init_pair(11, curses.COLOR_WHITE, curses.COLOR_RED)       # CRIT selected
+        curses.init_pair(12, curses.COLOR_BLACK, curses.COLOR_YELLOW)    # HIGH selected
+        curses.init_pair(13, curses.COLOR_BLACK, curses.COLOR_CYAN)      # MED  selected
+        curses.init_pair(14, curses.COLOR_WHITE, curses.COLOR_BLUE)      # LOW  selected
+        curses.init_pair(15, curses.COLOR_BLACK, curses.COLOR_WHITE)     # neutral selected (excluded/done)
+    except curses.error:
+        pass
 
 
 BANNER_LINES = [
@@ -528,7 +556,44 @@ def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
     Returns dict: {"action": "scan"|"exit", "scan_order": [...],
                    "order": [...], "excluded": set(...)}
     """
-    tier_pair = {"CRIT": 5, "HIGH": 4, "MED": 1, "LOW": 6}
+    # per-tier colours: badge text pair + tinted selection-bar pair
+    TIER_TXT = {"CRIT": 5, "HIGH": 4, "MED": 1, "LOW": 7}
+    TIER_BAR = {"CRIT": 11, "HIGH": 12, "MED": 13, "LOW": 14}
+    NEUTRAL_BAR = 15
+
+    X_BADGE, X_IP, X_REASON, X_PORTS = 2, 9, 25, 53
+
+    def _ports_preview(ports, width):
+        if not ports:
+            return "no ports from sweep"
+        s = sorted(ports)
+        out, truncated = "", False
+        for i, p in enumerate(s):
+            add = str(p) if i == 0 else f", {p}"
+            reserve = 6 if (len(s) - (i + 1)) > 0 else 0
+            if i > 0 and len(out) + len(add) + reserve > width:
+                truncated = True
+                break
+            out += add
+        if truncated:
+            out += " [...]"
+        return out
+
+    def _wrap_ports(ports, width, max_rows):
+        toks = [str(p) for p in sorted(ports)]
+        lines, cur = [], ""
+        for tok in toks:
+            add = tok if not cur else ", " + tok
+            if cur and len(cur) + len(add) > width:
+                lines.append(cur); cur = tok
+            else:
+                cur += add
+        if cur:
+            lines.append(cur)
+        if len(lines) > max_rows:
+            lines = lines[:max_rows]
+            lines[-1] = lines[-1][:max(0, width - 2)] + " " + _ELL
+        return lines or ["-"]
 
     def _run(stdscr):
         curses.curs_set(0)
@@ -545,98 +610,145 @@ def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
             stdscr.erase()
             h, w = stdscr.getmaxyx()
             total = len(order)
-
-            # ── Header + tier tally ──
-            tally = {"CRIT": 0, "HIGH": 0, "MED": 0, "LOW": 0}
-            for ip in order:
-                tally[priorities[ip][1]] += 1
             n_excl = len(excluded & set(order))
             n_done = len(completed & set(order))
+
+            DETAIL_ROWS = 5
+            list_top = 2
+            list_h = max(1, h - list_top - DETAIL_ROWS)
+            detail_top = h - DETAIL_ROWS
+
+            # ── Header: count (green) + subtitle (grey) · keys (top-right) ──
             try:
-                stdscr.addnstr(1, 2, "Target Queue — auto-prioritized for deep scan",
-                               w - 3, curses.color_pair(1) | curses.A_BOLD)
-                summary = (f"{total} hosts    "
-                           f"CRIT {tally['CRIT']}  HIGH {tally['HIGH']}  "
-                           f"MED {tally['MED']}  LOW {tally['LOW']}    "
-                           f"excluded {n_excl}   done {n_done}")
-                stdscr.addnstr(2, 2, summary, w - 3, curses.color_pair(6))
+                left = f"  {total} host(s) found"
+                stdscr.addnstr(0, 0, left, w - 1, curses.color_pair(3) | curses.A_BOLD)
+                sub = "  (sorted by priority)"
+                if len(left) + len(sub) < w - 1:
+                    stdscr.addnstr(0, len(left), sub, w - 1 - len(left), curses.color_pair(6))
+                keys = (f"ENTER deep-scan   {_ARROW_UD} move   {_SHIFT_UD} reorder   "
+                        "SPACE exclude   R reset   Q quit ")
+                if len(left) + len(sub) + len(keys) + 3 <= w:
+                    stdscr.addnstr(0, w - len(keys) - 1, keys, len(keys),
+                                   curses.color_pair(1) | curses.A_BOLD)
+                else:
+                    kshort = f"ENTER scan  {_ARROW_UD} move  Q quit "
+                    if len(left) + len(kshort) + 2 <= w:
+                        stdscr.addnstr(0, w - len(kshort) - 1, kshort, len(kshort),
+                                       curses.color_pair(1) | curses.A_BOLD)
             except curses.error:
                 pass
 
-            list_start = 4
-            footer_rows = 4
-            visible = max(1, h - list_start - footer_rows)
+            # rule + status/scroll info on row 1
+            try:
+                stdscr.addnstr(1, 0, _HLINE * (w - 1), w - 1, curses.color_pair(6))
+                info = []
+                if n_excl:
+                    info.append(f"{n_excl} excluded")
+                if n_done:
+                    info.append(f"{n_done} done")
+                if total > list_h:
+                    lo = scroll + 1
+                    hi = min(scroll + list_h, total)
+                    info.append(f"showing {lo}-{hi} of {total}")
+                if msg:
+                    stdscr.addnstr(1, 2, f" {msg} ", w - 3,
+                                   curses.color_pair(4) | curses.A_BOLD | curses.A_REVERSE)
+                elif info:
+                    s = "  " + _DOT.join(info) + "  "
+                    stdscr.addnstr(1, max(2, w - len(s) - 1), s, w - 3, curses.color_pair(6))
+            except curses.error:
+                pass
 
+            # keep cursor in view
             if cursor < scroll:
                 scroll = cursor
-            if cursor >= scroll + visible:
-                scroll = cursor - visible + 1
+            if cursor >= scroll + list_h:
+                scroll = cursor - list_h + 1
 
-            for idx in range(scroll, min(scroll + visible, total)):
-                y = list_start + (idx - scroll)
+            # ── Host rows ──
+            for idx in range(scroll, min(scroll + list_h, total)):
+                y = list_top + (idx - scroll)
                 ip = order[idx]
-                score, tier, reason = priorities[ip]
+                _score, tier, reason = priorities[ip]
                 is_excl = ip in excluded
                 is_done = ip in completed
-                pcount = len(hosts_ports[ip])
                 is_cur = (idx == cursor)
 
-                if is_done:
-                    base = curses.color_pair(3)
-                elif is_excl:
-                    base = curses.color_pair(6)
-                else:
-                    base = curses.color_pair(2)
-                if is_cur:
-                    base |= curses.A_BOLD
-
-                cur_mark = ">" if is_cur else " "
                 badge = f"[{tier:<4}]"
-                tag = "  [done]" if is_done else ("  [excluded]" if is_excl else "")
+                rwidth = max(6, X_PORTS - X_REASON - 1)
+                rtext = reason if len(reason) <= rwidth else reason[:rwidth - 1] + _ELL
+                pwidth = max(6, w - X_PORTS - 1)
+                if is_excl:
+                    preview = "excluded - won't be scanned"
+                elif is_done:
+                    preview = f"done {_CHECK}  " + _ports_preview(hosts_ports[ip], pwidth - 8)
+                else:
+                    preview = _ports_preview(hosts_ports[ip], pwidth)
 
                 try:
-                    stdscr.addnstr(y, 1, cur_mark, 1,
-                                   (curses.color_pair(1) | curses.A_BOLD) if is_cur else base)
-                    stdscr.addnstr(y, 3, f"{idx + 1:>2}", 2, base)
-                    if is_excl or is_done:
-                        badge_attr = base
+                    if is_cur:
+                        bar = NEUTRAL_BAR if (is_excl or is_done) else TIER_BAR[tier]
+                        attr = curses.color_pair(bar) | curses.A_BOLD
+                        stdscr.addnstr(y, 0, " " * (w - 1), w - 1, attr)   # paint the bar
+                        stdscr.addnstr(y, X_BADGE, badge, 6, attr)
+                        stdscr.addnstr(y, X_IP, f"{ip:<15}", 15, attr)
+                        if w > X_REASON + 4:
+                            stdscr.addnstr(y, X_REASON, rtext, rwidth, attr)
+                        if w > X_PORTS + 4:
+                            stdscr.addnstr(y, X_PORTS, preview, pwidth, attr)
                     else:
-                        badge_attr = curses.color_pair(tier_pair[tier]) | (curses.A_BOLD if is_cur else 0)
-                    stdscr.addnstr(y, 6, badge, 6, badge_attr)
-                    stdscr.addnstr(y, 13, f"{ip:<15}", 15, base)
-                    stdscr.addnstr(y, 29, f"{pcount:>3}", 3, base)
-                    rx = 33
-                    avail = max(4, w - rx - 1)
-                    text = reason
-                    if len(text) + len(tag) > avail:
-                        text = text[:max(1, avail - len(tag) - 1)] + "~"
-                    stdscr.addnstr(y, rx, (text + tag)[:avail], avail, base)
+                        if is_done:
+                            base = curses.color_pair(3)
+                        elif is_excl:
+                            base = curses.color_pair(6)
+                        else:
+                            base = curses.color_pair(2)
+                        badge_attr = (curses.color_pair(6) if (is_excl or is_done)
+                                      else curses.color_pair(TIER_TXT[tier]) | curses.A_BOLD)
+                        stdscr.addnstr(y, X_BADGE, badge, 6, badge_attr)
+                        stdscr.addnstr(y, X_IP, f"{ip:<15}", 15,
+                                       base if (is_excl or is_done) else curses.color_pair(1))
+                        if w > X_REASON + 4:
+                            stdscr.addnstr(y, X_REASON, rtext, rwidth, base)
+                        if w > X_PORTS + 4:
+                            stdscr.addnstr(y, X_PORTS, preview, pwidth, curses.color_pair(6))
                 except curses.error:
                     pass
 
-            # ── Detail: ports of the highlighted host ──
-            detail_y = list_start + visible
-            if 0 <= cursor < total:
-                ip = order[cursor]
-                ports = sorted(hosts_ports[ip])
-                plist = ", ".join(str(x) for x in ports) if ports else "(none in sweep — re-verified at scan time)"
-                try:
-                    stdscr.addnstr(detail_y, 2, "-" * max(0, min(w - 4, 72)), w - 3, curses.color_pair(6))
-                    label = f"{ip}  open: "
-                    stdscr.addnstr(detail_y + 1, 2, label, w - 3, curses.color_pair(1))
-                    stdscr.addnstr(detail_y + 1, 2 + len(label), plist,
-                                   max(1, w - 3 - len(label)), curses.color_pair(2))
-                except curses.error:
-                    pass
-
-            # ── Footer ──
-            fy = detail_y + 2
+            # ── Bottom detail pane: full open ports of the highlighted host ──
             try:
-                if msg:
-                    stdscr.addnstr(fy, 2, msg, w - 3, curses.color_pair(4) | curses.A_BOLD)
-                keys = ("[Up/Dn] move   [K/J] reorder   [space] exclude   "
-                        "[Enter] SCAN ALL   [r] reset   [q] exit")
-                stdscr.addnstr(min(fy + 1, h - 1), 2, keys, w - 3, curses.color_pair(6))
+                stdscr.addnstr(detail_top, 0, _HLINE * (w - 1), w - 1, curses.color_pair(6))
+                if 0 <= cursor < total:
+                    ip = order[cursor]
+                    _score, tier, reason = priorities[ip]
+                    ports = hosts_ports[ip]
+                    tag = ""
+                    if ip in completed:
+                        tag = "   [ already scanned ]"
+                    elif ip in excluded:
+                        tag = "   [ excluded from scan ]"
+                    head = f"  {ip}"
+                    stdscr.addnstr(detail_top + 1, 0, head, w - 1,
+                                   curses.color_pair(1) | curses.A_BOLD)
+                    meta = f"   {tier}{_DOT}{reason}{tag}"
+                    if len(head) + len(meta) < w - 1:
+                        stdscr.addnstr(detail_top + 1, len(head), meta, w - 1 - len(head),
+                                       curses.color_pair(TIER_TXT.get(tier, 2)))
+                    label = f"  open ports ({len(ports)}): " if ports else "  open ports: "
+                    if not ports:
+                        stdscr.addnstr(detail_top + 2, 0,
+                                       "  (none from sweep - will be re-verified on deep scan)",
+                                       w - 1, curses.color_pair(6))
+                    else:
+                        stdscr.addnstr(detail_top + 2, 0, label, w - 1, curses.color_pair(6))
+                        indent = len(label)
+                        rows = _wrap_ports(ports, max(10, w - indent - 1), DETAIL_ROWS - 2)
+                        for r, line in enumerate(rows):
+                            yy = detail_top + 2 + r
+                            xx = indent if r == 0 else indent
+                            if yy < h:
+                                stdscr.addnstr(yy, xx, line, max(1, w - xx - 1),
+                                               curses.color_pair(2))
             except curses.error:
                 pass
 
@@ -659,7 +771,7 @@ def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
             elif key in (ord(' '), ord('x'), ord('X')):
                 ip = order[cursor]
                 if ip in completed:
-                    msg = f"{ip} already scanned — can't exclude a completed host."
+                    msg = f"{ip} already scanned - can't exclude a completed host."
                 elif ip in excluded:
                     excluded.discard(ip)
                 else:
@@ -671,7 +783,7 @@ def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
             elif key in (curses.KEY_ENTER, 10, 13):
                 scan_order = [ip for ip in order if ip not in excluded and ip not in completed]
                 if not scan_order:
-                    msg = "Nothing to scan — every host is excluded or already done."
+                    msg = "Nothing to scan - every host is excluded or already done."
                 else:
                     return {"action": "scan", "scan_order": scan_order,
                             "order": order, "excluded": excluded}
