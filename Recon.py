@@ -4,8 +4,8 @@ Recon.py v2.1 — Automated Nmap Recon Pipeline
 ──────────────────────────────────────────────
 Modes:
   1. Single Target           — standard scan against one host
-  2. Single Target (Pivot)   — scan through Ligolo-ng tunnel
-  3. Network Range           — discover + scan a network range
+  2. Network Range           — discover + scan a network range
+  3. Single Target (Pivot)   — scan through Ligolo-ng tunnel
   4. Network Range (Pivot)   — discover + scan through Ligolo-ng tunnel
 
 Workflow:  UDP (background) → deep top-1000 → full sweep → new-port deep scan
@@ -192,8 +192,8 @@ def curses_select_mode():
     """Mode selection screen with banner. Returns mode index (0-3) or -1 for exit."""
     modes = [
         ("Single Target",            "Standard scan against one host"),
-        ("Single Target  [PIVOT]",   "Scan through active Ligolo-ng tunnel (--unprivileged, no min-rate)"),
         ("Network Range",            "fping+nmap discovery, then scan a network range"),
+        ("Single Target  [PIVOT]",   "Scan through active Ligolo-ng tunnel (--unprivileged, no min-rate)"),
         ("Network Range  [PIVOT]",   "Discover and scan through active Ligolo-ng tunnel"),
     ]
 
@@ -1643,8 +1643,8 @@ def main():
         console.print("\n  Exited.\n")
         sys.exit(0)
 
-    pivot   = mode in (1, 3)
-    network = mode in (2, 3)
+    pivot   = mode in (2, 3)
+    network = mode in (1, 3)
 
     # ── Banner (rich) ──
     banner(pivot=pivot)
