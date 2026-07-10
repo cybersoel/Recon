@@ -549,28 +549,24 @@ def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
       completed   : set of already-scanned IPs
 
     Controls:
-      Up/Down (k/j)   move cursor
-      Enter           on a host: GRAB it (swap source); Enter on a 2nd host swaps
-                      the two; Enter on the grabbed host again cancels.
-                      on an action row: run that action.
-      Space           start the deep-scan autoscan (shortcut)
-      x               toggle exclude (grey out; skipped by the scan)
-      q               quit (asks whether to save the list)
-      esc             cancel a grab, or quit if none active
+      Up/Down (k/j)   move cursor (wraps top<->bottom)
+      Enter           on a host: pick it up; move with Up/Down to drag it, Enter
+                      again to drop it in place.  on an action row: run it.
+      Space           toggle exclude on the highlighted host (grey out)
+      r               reset the order back to the priority sort
+      q / esc         quit (esc first drops a held row); quitting asks to save
 
-    Two pinned action rows sit under the list:
-      * Start deep scan          -> autoscan all non-excluded hosts, in order
-      * Save list & exit         -> save the sheet in its current order, no prompt
+    Two action rows sit under the list (select + Enter):
+      * Proceed deep scan (in this order)   -> scan all non-excluded hosts, in order
+      * Save list & exit                    -> save the sheet as-is, no prompt
 
     Returns dict:
       {"action":"scan", "scan_order":[...], "order":[...], "excluded":set}
       {"action":"exit", "save":"auto"|"ask", "order":[...], "excluded":set}
     """
-    TIER_TXT = {"CRIT": 5, "HIGH": 4, "MED": 1, "LOW": 7}
-    TIER_BAR = {"CRIT": 11, "HIGH": 12, "MED": 13, "LOW": 14}
-    NEUTRAL_BAR = 15
-    GRAB_BAR = 16
-    SCAN_BAR = 17
+    TIER_TXT   = {"CRIT": 5, "HIGH": 4, "MED": 1, "LOW": 7}   # badge text colour (info only)
+    CURSOR_BAR = 14   # ONE selection colour for every row (white on blue)
+    GRAB_BAR   = 16   # colour of a row while it is being dragged (white on magenta)
 
     X_BADGE, X_IP, X_REASON, X_PORTS = 2, 9, 25, 53
 
@@ -618,7 +614,7 @@ def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
                 cursor = i
                 break
         scroll = 0
-        grabbed = None   # index into order of the grabbed host, or None
+        dragging = False
         msg = ""
 
         while True:
@@ -631,7 +627,7 @@ def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
             n_done = len(completed & set(order))
 
             DETAIL_ROWS = 5
-            ACTION_ROWS = 3           # 1 separator + 2 pinned action buttons
+            ACTION_ROWS = 3
             list_top = 2
             list_h = max(1, h - list_top - DETAIL_ROWS - ACTION_ROWS)
             act_sep_y = list_top + list_h
@@ -641,32 +637,33 @@ def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
 
             cursor = max(0, min(cursor, n_nav - 1))
 
-            # ── Header: count (green) + subtitle (grey) · keys (top-right) ──
+            # ── Header: count (green) + subtitle (grey) · key guide (top-right) ──
             try:
                 left = f"  {n_hosts} host(s) found"
                 stdscr.addnstr(0, 0, left, w - 1, curses.color_pair(3) | curses.A_BOLD)
                 sub = "  (sorted by priority)"
                 if len(left) + len(sub) < w - 1:
                     stdscr.addnstr(0, len(left), sub, w - 1 - len(left), curses.color_pair(6))
-                keys = f"ENTER swap   {_ARROW_UD} move   Q quit "
+                keys = f"{_ARROW_UD} move   ENTER grab/drop   SPACE exclude   R reset   Q quit "
+                kshort = f"{_ARROW_UD} move   ENTER drag   R reset   Q quit "
                 if len(left) + len(sub) + len(keys) + 2 <= w:
                     stdscr.addnstr(0, w - len(keys) - 1, keys, len(keys),
+                                   curses.color_pair(1) | curses.A_BOLD)
+                elif len(left) + len(kshort) + 2 <= w:
+                    stdscr.addnstr(0, w - len(kshort) - 1, kshort, len(kshort),
                                    curses.color_pair(1) | curses.A_BOLD)
             except curses.error:
                 pass
 
-            # ── Row 1: rule + (transient msg | grab status | counts/scroll) ──
+            # ── Row 1: rule + (transient msg | drag status | counts/scroll) ──
             try:
                 stdscr.addnstr(1, 0, _HLINE * (w - 1), w - 1, curses.color_pair(6))
                 if msg:
                     stdscr.addnstr(1, 2, f" {msg} ", w - 3,
                                    curses.color_pair(4) | curses.A_BOLD | curses.A_REVERSE)
-                elif grabbed is not None and grabbed < n_hosts:
-                    gip = order[grabbed]
-                    gstat = (f" grabbed {gip} {_DOT.strip()} move to a target and press "
-                             f"ENTER to swap (ENTER on it again to cancel) ")
-                    stdscr.addnstr(1, 2, gstat, w - 3,
-                                   curses.color_pair(16) | curses.A_BOLD)
+                elif dragging:
+                    gstat = f" holding {order[cursor]}   {_ARROW_UD} to move it, ENTER to drop "
+                    stdscr.addnstr(1, 2, gstat, w - 3, curses.color_pair(16) | curses.A_BOLD)
                 else:
                     info = []
                     if n_excl:
@@ -674,16 +671,13 @@ def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
                     if n_done:
                         info.append(f"{n_done} done")
                     if n_hosts > list_h:
-                        lo = scroll + 1
-                        hi = min(scroll + list_h, n_hosts)
-                        info.append(f"showing {lo}-{hi} of {n_hosts}")
+                        info.append(f"showing {scroll+1}-{min(scroll+list_h, n_hosts)} of {n_hosts}")
                     if info:
                         s = "  " + _DOT.join(info) + "  "
                         stdscr.addnstr(1, max(2, w - len(s) - 1), s, w - 3, curses.color_pair(6))
             except curses.error:
                 pass
 
-            # keep host cursor in view (action rows are pinned, don't scroll)
             if cursor < n_hosts:
                 if cursor < scroll:
                     scroll = cursor
@@ -698,7 +692,6 @@ def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
                 is_excl = ip in excluded
                 is_done = ip in completed
                 is_cur = (idx == cursor)
-                is_grab = (idx == grabbed)
 
                 badge = f"[{tier:<4}]"
                 rwidth = max(6, X_PORTS - X_REASON - 1)
@@ -712,14 +705,8 @@ def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
                     preview = _ports_preview(hosts_ports[ip], pwidth)
 
                 try:
-                    if is_grab or is_cur:
-                        if is_grab:
-                            bar = GRAB_BAR
-                        elif is_excl or is_done:
-                            bar = NEUTRAL_BAR
-                        else:
-                            bar = TIER_BAR[tier]
-                        attr = curses.color_pair(bar) | curses.A_BOLD
+                    if is_cur:
+                        attr = curses.color_pair(GRAB_BAR if dragging else CURSOR_BAR) | curses.A_BOLD
                         stdscr.addnstr(y, 0, " " * (w - 1), w - 1, attr)
                         stdscr.addnstr(y, X_BADGE, badge, 6, attr)
                         stdscr.addnstr(y, X_IP, f"{ip:<15}", 15, attr)
@@ -743,38 +730,18 @@ def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
                 except curses.error:
                     pass
 
-            # ── Pinned action buttons ──
-            scannable = _scannable()
+            # ── Action rows: plain, aligned, one colour ──
             try:
                 stdscr.addnstr(act_sep_y, 0, _HLINE * (w - 1), w - 1, curses.color_pair(6))
-
-                # Start deep scan
-                sc_label = f"  {_PLAY}  Start deep scan"
-                sc_hint = f"   scan {len(scannable)} host(s) in this order"
-                if cursor == ACT_SCAN:
-                    a = curses.color_pair(SCAN_BAR) | curses.A_BOLD
-                    stdscr.addnstr(act_scan_y, 0, " " * (w - 1), w - 1, a)
-                    stdscr.addnstr(act_scan_y, 2, (sc_label + sc_hint).strip(), w - 3, a)
-                else:
-                    stdscr.addnstr(act_scan_y, 2, sc_label.strip(), w - 3,
-                                   curses.color_pair(3) | curses.A_BOLD)
-                    if w > 30:
-                        stdscr.addnstr(act_scan_y, 2 + len(sc_label.strip()) + 1,
-                                       sc_hint.strip(), w - 4, curses.color_pair(6))
-
-                # Save list & exit
-                sv_label = "  Save list & exit"
-                sv_hint = "   don't scan now - I'll scan hosts individually later"
-                if cursor == ACT_SAVE:
-                    a = curses.color_pair(NEUTRAL_BAR) | curses.A_BOLD
-                    stdscr.addnstr(act_save_y, 0, " " * (w - 1), w - 1, a)
-                    stdscr.addnstr(act_save_y, 2, (sv_label + sv_hint).strip(), w - 3, a)
-                else:
-                    stdscr.addnstr(act_save_y, 2, sv_label.strip(), w - 3,
-                                   curses.color_pair(1))
-                    if w > 30:
-                        stdscr.addnstr(act_save_y, 2 + len(sv_label.strip()) + 1,
-                                       sv_hint.strip(), w - 4, curses.color_pair(6))
+                for ay, txt, aidx in ((act_scan_y, "Proceed deep scan (in this order)", ACT_SCAN),
+                                      (act_save_y, "Save list & exit", ACT_SAVE)):
+                    if cursor == aidx:
+                        a = curses.color_pair(CURSOR_BAR) | curses.A_BOLD
+                        stdscr.addnstr(ay, 0, " " * (w - 1), w - 1, a)
+                        stdscr.addnstr(ay, X_BADGE, txt, w - X_BADGE - 1, a)
+                    else:
+                        stdscr.addnstr(ay, X_BADGE, txt, w - X_BADGE - 1,
+                                       curses.color_pair(2) | curses.A_BOLD)
             except curses.error:
                 pass
 
@@ -785,11 +752,8 @@ def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
                     ip = order[cursor]
                     _score, tier, reason = priorities[ip]
                     ports = hosts_ports[ip]
-                    tag = ""
-                    if ip in completed:
-                        tag = "   [ already scanned ]"
-                    elif ip in excluded:
-                        tag = "   [ excluded from scan ]"
+                    tag = ("   [ already scanned ]" if ip in completed
+                           else "   [ excluded from scan ]" if ip in excluded else "")
                     head = f"  {ip}"
                     stdscr.addnstr(detail_top + 1, 0, head, w - 1,
                                    curses.color_pair(1) | curses.A_BOLD)
@@ -806,26 +770,24 @@ def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
                         stdscr.addnstr(detail_top + 2, 0, label, w - 1,
                                        curses.color_pair(3) | curses.A_BOLD)
                         indent = len(label)
-                        rows = _wrap_ports(ports, max(10, w - indent - 1), DETAIL_ROWS - 2)
-                        for r, line in enumerate(rows):
+                        for r, line in enumerate(_wrap_ports(ports, max(10, w - indent - 1),
+                                                             DETAIL_ROWS - 2)):
                             yy = detail_top + 2 + r
                             if yy < h:
                                 stdscr.addnstr(yy, indent, line, max(1, w - indent - 1),
                                                curses.color_pair(2))
                 elif cursor == ACT_SCAN:
-                    stdscr.addnstr(detail_top + 1, 0,
-                                   f"  {_PLAY} Start deep scan", w - 1,
-                                   curses.color_pair(3) | curses.A_BOLD)
+                    stdscr.addnstr(detail_top + 1, 0, "  Proceed deep scan", w - 1,
+                                   curses.color_pair(2) | curses.A_BOLD)
                     stdscr.addnstr(detail_top + 2, 0,
-                                   f"  Deep-scans {len(scannable)} host(s) top-to-bottom in the "
-                                   f"order shown. Excluded/done hosts are skipped.",
+                                   f"  Deep-scan {len(_scannable())} host(s) in the order above. "
+                                   f"Excluded / done hosts are skipped.",
                                    w - 1, curses.color_pair(6))
                 else:
                     stdscr.addnstr(detail_top + 1, 0, "  Save list & exit", w - 1,
-                                   curses.color_pair(1) | curses.A_BOLD)
+                                   curses.color_pair(2) | curses.A_BOLD)
                     stdscr.addnstr(detail_top + 2, 0,
-                                   "  Saves this sheet (current order) to targets_priority.txt "
-                                   "in the range folder, then exits.",
+                                   "  Save the list (current order) to targets_priority.txt, then exit.",
                                    w - 1, curses.color_pair(6))
             except curses.error:
                 pass
@@ -835,10 +797,20 @@ def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
             msg = ""
 
             if key in (curses.KEY_UP, ord('k')):
-                cursor = max(0, cursor - 1)
+                if dragging:
+                    if cursor > 0:
+                        order[cursor - 1], order[cursor] = order[cursor], order[cursor - 1]
+                        cursor -= 1
+                else:
+                    cursor = (n_nav - 1) if cursor == 0 else cursor - 1
             elif key in (curses.KEY_DOWN, ord('j')):
-                cursor = min(n_nav - 1, cursor + 1)
-            elif key in (ord('x'), ord('X')):
+                if dragging:
+                    if cursor < n_hosts - 1:
+                        order[cursor + 1], order[cursor] = order[cursor], order[cursor + 1]
+                        cursor += 1
+                else:
+                    cursor = 0 if cursor == n_nav - 1 else cursor + 1
+            elif key == ord(' '):
                 if cursor < n_hosts:
                     ip = order[cursor]
                     if ip in completed:
@@ -847,22 +819,14 @@ def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
                         excluded.discard(ip)
                     else:
                         excluded.add(ip)
-            elif key == ord(' '):
-                so = _scannable()
-                if not so:
-                    msg = "Nothing to scan - every host is excluded or already done."
-                else:
-                    return {"action": "scan", "scan_order": so,
-                            "order": order, "excluded": excluded}
+            elif key in (ord('r'), ord('R')):
+                dragging = False
+                order.sort(key=lambda x: (_TIER_RANK[priorities[x][1]], -priorities[x][0],
+                                          ipaddress.IPv4Address(x)))
+                msg = "Order reset to priority sort."
             elif key in (curses.KEY_ENTER, 10, 13):
                 if cursor < n_hosts:
-                    if grabbed is None:
-                        grabbed = cursor
-                    elif grabbed == cursor:
-                        grabbed = None
-                    else:
-                        order[grabbed], order[cursor] = order[cursor], order[grabbed]
-                        grabbed = None
+                    dragging = not dragging          # pick up / drop
                 elif cursor == ACT_SCAN:
                     so = _scannable()
                     if not so:
@@ -870,12 +834,12 @@ def curses_target_manager(hosts_ports, priorities, order, excluded, completed):
                     else:
                         return {"action": "scan", "scan_order": so,
                                 "order": order, "excluded": excluded}
-                else:  # ACT_SAVE
+                else:
                     return {"action": "exit", "save": "auto",
                             "order": order, "excluded": excluded}
-            elif key == 27:                      # ESC cancels a grab, else quits
-                if grabbed is not None:
-                    grabbed = None
+            elif key == 27:                          # ESC drops a held row, else quits
+                if dragging:
+                    dragging = False
                 else:
                     return {"action": "exit", "save": "ask",
                             "order": order, "excluded": excluded}
@@ -1734,8 +1698,6 @@ def pipeline_network(cidr: str, minrate: int, pivot: bool):
         phase_header("PHASE 2 — FULL PORT SWEEP (ALL HOSTS)",
                      f"nmap -Pn -n -p- -v --open -iL live_hosts  ({rate_desc})",
                      pivot_note="+ --unprivileged" if pivot else "")
-        console.print(f"  [{C_DIM}]  This is a fast PREVIEW to prioritize hosts; each host you pick is "
-                      f"re-verified independently.[/]\n")
 
         sweep_flags = ["-n", "-p-", "-v", "--open"]
         if minrate > 0:
